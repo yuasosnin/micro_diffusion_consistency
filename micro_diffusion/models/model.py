@@ -20,6 +20,23 @@ from .utils import (
 )
 
 
+def unsqueeze_like(tensor: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+    """
+    Unsqueeze last dimensions of tensor to match another tensor's number of dimensions.
+
+    Args:
+        tensor (torch.Tensor): tensor to unsqueeze
+        like (torch.Tensor): tensor whose dimensions to match
+    """
+    n_unsqueezes = like.ndim - tensor.ndim
+    if n_unsqueezes < 0:
+        raise ValueError(f"tensor.ndim={tensor.ndim} > like.ndim={like.ndim}")
+    elif n_unsqueezes == 0:
+        return tensor
+    else:
+        return tensor[(...,) + (None,) * n_unsqueezes]
+
+
 class LatentDiffusion(ComposerModel):
     """Latent diffusion model that generates images from text prompts.
 
@@ -152,7 +169,7 @@ class LatentDiffusion(ComposerModel):
         **kwargs
     ) -> dict:
         """Wrapper for the model call in EDM (https://github.com/NVlabs/edm/blob/main/training/networks.py#L632)"""
-        sigma = sigma.to(x.dtype).reshape(-1, 1, 1, 1)
+        sigma = unsqueeze_like(sigma, x).to(x.dtype)
         c_skip = (
             self.edm_config.sigma_data ** 2 /
             (sigma ** 2 + self.edm_config.sigma_data ** 2)
@@ -180,8 +197,9 @@ class LatentDiffusion(ComposerModel):
         return out
 
     def edm_loss(self, x: torch.Tensor, y: torch.Tensor, mask_ratio: float = 0, **kwargs) -> torch.Tensor:
-        rnd_normal = torch.randn([x.shape[0], 1, 1, 1], device=x.device)
+        rnd_normal = torch.randn(x.shape[0], device=x.device)
         sigma = (rnd_normal * self.edm_config.P_std + self.edm_config.P_mean).exp()
+        sigma = unsqueeze_like(sigma, x)
         weight = (
             (sigma ** 2 + self.edm_config.sigma_data ** 2) /
             (sigma * self.edm_config.sigma_data) ** 2
@@ -248,16 +266,22 @@ class LatentDiffusion(ComposerModel):
         t_next: torch.Tensor,
         y: torch.Tensor,
         model_forward_fxn: callable,
-        step: int,
+        step: int | torch.Tensor,
         num_steps: int,
         **kwargs
     ) -> torch.Tensor:
+        t_cur = unsqueeze_like(t_cur, x_cur)
+        t_next = unsqueeze_like(t_next, x_cur)
+
         # Increase noise temporarily.
-        gamma = (
-            min(self.edm_config.S_churn / num_steps, np.sqrt(2) - 1)
-            if self.edm_config.S_min <= t_cur <= self.edm_config.S_max else 0
+        gamma_base = min(self.edm_config.S_churn / num_steps, np.sqrt(2) - 1)
+        use_churn = (t_cur >= self.edm_config.S_min) & (t_cur <= self.edm_config.S_max)
+        gamma = torch.where(
+            use_churn,
+            torch.full_like(t_cur, gamma_base, dtype=t_cur.dtype),
+            torch.zeros_like(t_cur, dtype=t_cur.dtype)
         )
-        t_hat = torch.as_tensor(t_cur + gamma * t_cur)
+        t_hat = t_cur + gamma * t_cur
         x_hat = (
             x_cur +
             (t_hat ** 2 - t_cur ** 2).sqrt() *
@@ -277,7 +301,8 @@ class LatentDiffusion(ComposerModel):
         x_next = x_hat + (t_next - t_hat) * d_cur
 
         # Apply 2nd order correction.
-        if step < num_steps - 1:
+        mask = unsqueeze_like(torch.as_tensor(step, device=x_cur.device) < num_steps - 1, x_cur)
+        if mask.any():
             denoised = self.model_forward_wrapper(
                 x_next.to(torch.float32),
                 t_next.to(torch.float32),
@@ -286,7 +311,11 @@ class LatentDiffusion(ComposerModel):
                 **kwargs
             )['sample'].to(torch.float64)
             d_prime = (x_next - denoised) / t_next
-            x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
+            x_next = torch.where(
+                mask,
+                x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime),
+                x_next
+            )
         return x_next
 
     @torch.no_grad()
@@ -308,7 +337,7 @@ class LatentDiffusion(ComposerModel):
         t_steps = self.create_time_steps(num_steps, device=x.device)
 
         # Main sampling loop.
-        x_next = x.to(torch.float64) * t_steps[0]
+        x_next = x.to(torch.float64) * unsqueeze_like(t_steps[0], x)
         for i, (t_cur, t_next) in tqdm(enumerate(zip(t_steps[:-1], t_steps[1:])), total=num_steps):  # 0, ..., N-1
             x_cur = x_next
             x_next = self.edm_sampler_step(x_cur, t_cur, t_next, y, model_forward_fxn, i, num_steps, **kwargs)
