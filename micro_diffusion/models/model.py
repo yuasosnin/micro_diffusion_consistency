@@ -587,7 +587,7 @@ def create_latent_diffusion(
         in_channels=in_channels
     )
     if dit_ckpt_path is not None:
-        dit.load_state_dict(torch.load(dit_ckpt_path))
+        dit.load_state_dict(torch.load(dit_ckpt_path), strict=False)
 
     vae = AutoencoderKL.from_pretrained(
         vae_name,
@@ -645,7 +645,7 @@ def create_latent_cm(
         in_channels=in_channels
     )
     if dit_ckpt_path is not None:
-        dit.load_state_dict(torch.load(dit_ckpt_path))
+        dit.load_state_dict(torch.load(dit_ckpt_path), strict=False)
     teacher_dit = deepcopy(dit) if init_teacher_dit else None
 
     vae = AutoencoderKL.from_pretrained(
