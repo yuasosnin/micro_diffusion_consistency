@@ -14,7 +14,7 @@ import open_clip
 from transformers import (
     CLIPTextModel,
     CLIPTokenizer,
-    T5EncoderModel, 
+    T5EncoderModel,
     T5Tokenizer
 )
 
@@ -33,7 +33,7 @@ def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch
 # Ref: https://github.com/huggingface/pytorch-image-models/blob/main/timm/layers/mlp.py
 class Mlp(nn.Module):
     """MLP implementation from timm (without the dropout layers)
-    
+
     Args:
         in_features (int): Input tensor dimension
         hidden_features (Optional[int], None): Number of hidden features. If None, same as in_features
@@ -66,7 +66,7 @@ class Mlp(nn.Module):
         x = self.norm(x)
         x = self.fc2(x)
         return x
-    
+
 
 def create_norm(norm_type: str, dim: int, eps: float = 1e-6) -> nn.Module:
     """Creates a normalization layer based on the specified type."""
@@ -76,11 +76,11 @@ def create_norm(norm_type: str, dim: int, eps: float = 1e-6) -> nn.Module:
         return nn.LayerNorm(dim, eps=eps, elementwise_affine=False, bias=False)
     else:
         raise ValueError('Norm type not supported!')
-    
+
 
 class CrossAttention(nn.Module):
     """Cross attention layer.
-    
+
     Args:
         dim (int): Input and output tensor dimension
         num_heads (int): Number of attention heads
@@ -130,11 +130,11 @@ class CrossAttention(nn.Module):
             v.transpose(1, 2),
             is_causal=False
         ).transpose(1, 2).contiguous()
-        
+
         x = x.view(B, -1, self.num_heads * self.head_dim)
         x = self.proj(x)
         return x
-    
+
     def custom_init(self, init_std: float) -> None:
         for linear in (self.q_linear, self.kv_linear):
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
@@ -143,7 +143,7 @@ class CrossAttention(nn.Module):
 
 class SelfAttention(nn.Module):
     """Self attention layer.
-    
+
     Args:
         dim (int): Input and output tensor dimension
         num_heads (int): Number of attention heads
@@ -191,11 +191,11 @@ class SelfAttention(nn.Module):
             v.transpose(1, 2),
             is_causal=False
         ).transpose(1, 2).contiguous()
-        
+
         x = x.view(B, N, self.num_heads * self.head_dim)
         x = self.proj(x)
         return x
-    
+
     def custom_init(self, init_std: float) -> None:
         nn.init.trunc_normal_(self.qkv.weight, mean=0.0, std=0.02)
         nn.init.trunc_normal_(self.proj.weight, mean=0.0, std=init_std)
@@ -203,11 +203,11 @@ class SelfAttention(nn.Module):
 
 class T2IFinalLayer(nn.Module):
     """The final layer of DiT architecture.
-    
+
     Args:
         hidden_size (int): Size of hidden dimension
         time_emb_dim (int): Dimension of timestep embeddings
-        patch_size (int): Size of image patches 
+        patch_size (int): Size of image patches
         out_channels (int): Number of output channels
         act_layer (Any): Activation layer constructor
         norm_final (nn.Module): Final normalization layer
@@ -242,7 +242,7 @@ class T2IFinalLayer(nn.Module):
 
 class TimestepEmbedder(nn.Module):
     """Embeds scalar timesteps into vector representations.
-    
+
     Args:
         hidden_size (int): Size of hidden dimension
         act_layer (Any): Activation layer constructor
@@ -291,7 +291,7 @@ class TimestepEmbedder(nn.Module):
 
 class CaptionProjection(nn.Module):
     """Projects caption embeddings to model dimension.
-    
+
     Args:
         in_channels (int): Number of input channels
         hidden_size (int): Size of hidden dimension
@@ -313,7 +313,7 @@ class CaptionProjection(nn.Module):
             act_layer=act_layer,
             norm_layer=norm_layer
         )
-    
+
     def forward(self, caption: torch.Tensor) -> torch.Tensor:
         return self.y_proj(caption)
 
@@ -380,8 +380,8 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos: np.ndarray) -> np.nda
 
 
 def get_mask(batch: int, length: int, mask_ratio: float, device: torch.device) -> Dict[str, torch.Tensor]:
-    """Get binary mask for input sequence. 
-    
+    """Get binary mask for input sequence.
+
     mask: binary mask, 0 is keep, 1 is remove
     ids_keep: indices of tokens to keep
     ids_restore: indices to restore the original order
@@ -428,7 +428,7 @@ def unmask_tokens(x: torch.Tensor, ids_restore: torch.Tensor, mask_token: torch.
 
 class UniversalTextEncoder(torch.nn.Module):
     """Universal text encoder supporting multiple model types.
-    
+
     Args:
         name (str): Name/path of the model to load
         dtype (str): Data type for model weights
@@ -471,7 +471,7 @@ class UniversalTextEncoder(torch.nn.Module):
 
 class openclip_text_encoder(torch.nn.Module):
     """OpenCLIP text encoder wrapper.
-    
+
     Args:
         clip_model (Any): OpenCLIP model instance
         dtype (torch.dtype, torch.float32): Data type for model weights
@@ -509,18 +509,18 @@ def text_encoder_embedding_format(enc: str) -> Tuple[int, int]:
     if enc in ["DeepFloyd/t5-v1_1-xxl"]:
         return 120, 4096
     raise ValueError(f'Please specifcy the sequence and embedding size of {enc} encoder')
-    
-    
+
+
 class simple_2_hf_tokenizer_wrapper:
     """Simple wrapper to make OpenCLIP tokenizer match HuggingFace interface.
-    
+
     Args:
         tokenizer (Any): OpenCLIP tokenizer instance
     """
     def __init__(self, tokenizer: Any):
         self.tokenizer = tokenizer
         self.model_max_length = self.tokenizer.context_length
-        
+
     def __call__(
         self,
         caption: str,
@@ -534,7 +534,7 @@ class simple_2_hf_tokenizer_wrapper:
 
 class UniversalTokenizer:
     """Universal tokenizer supporting multiple model types.
-    
+
     Args:
         name (str): Name/path of the tokenizer to load
     """
@@ -552,7 +552,7 @@ class UniversalTokenizer:
             self.tokenizer = CLIPTokenizer.from_pretrained(name, subfolder='tokenizer')
             assert s == self.tokenizer.model_max_length, "simply check of text_encoder_embedding_format"
         self.model_max_length = s
-        
+
     def tokenize(self, captions: Union[str, List[str]]) -> Dict[str, torch.Tensor]:
         if self.name == "DeepFloyd/t5-v1_1-xxl":
             text_tokens_and_mask = self.tokenizer(
@@ -578,7 +578,7 @@ class UniversalTokenizer:
                 return_tensors='pt'
             )['input_ids']
             return {'input_ids': tokenized_caption}
-        
+
 
 def _cast_if_autocast_enabled(tensor: torch.Tensor) -> torch.Tensor:
     """Cast tensor if autocast is enabled."""
@@ -595,7 +595,7 @@ def _cast_if_autocast_enabled(tensor: torch.Tensor) -> torch.Tensor:
 
 class DistLoss(Metric):
     """Distributed loss metric.
-    
+
     Args:
         kwargs (Any): Additional arguments passed to parent class
     """
@@ -610,3 +610,20 @@ class DistLoss(Metric):
 
     def compute(self) -> torch.Tensor:
         return self.loss.float() / self.batches
+
+
+def unsqueeze_like(tensor: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+    """
+    Unsqueeze last dimensions of tensor to match another tensor's number of dimensions.
+
+    Args:
+        tensor (torch.Tensor): tensor to unsqueeze
+        like (torch.Tensor): tensor whose dimensions to match
+    """
+    n_unsqueezes = like.ndim - tensor.ndim
+    if n_unsqueezes < 0:
+        raise ValueError(f"tensor.ndim={tensor.ndim} > like.ndim={like.ndim}")
+    elif n_unsqueezes == 0:
+        return tensor
+    else:
+        return tensor[(...,) + (None,) * n_unsqueezes]
