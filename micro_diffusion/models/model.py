@@ -492,10 +492,10 @@ class LatentConsistencyModel(LatentDiffusion):
         # Push one step down using TEACHER
         with torch.no_grad():
             x_lo = self.edm_sampler_step(x_hi, sigma_hi, sigma_lo, y, self.teacher_dit.forward, step=i, num_steps=num_steps, cfg=cfg)
-            z_lo = self.model_forward_wrapper(x_lo, sigma_lo, y, self.target_dit.forward_without_cfg, lcm_cfg=cfg)['sample']
+            z_lo = self.model_forward_wrapper(x_lo, sigma_lo, y, self.target_dit.forward, lcm_cfg=cfg)['sample']
 
         # Student predictions
-        z_hi = self.model_forward_wrapper(x_hi, sigma_hi, y, self.dit.forward_without_cfg, lcm_cfg=cfg)['sample']
+        z_hi = self.model_forward_wrapper(x_hi, sigma_hi, y, self.dit.forward, lcm_cfg=cfg)['sample']
 
         # Losses
         loss = F.mse_loss(z_hi, z_lo)
@@ -552,14 +552,14 @@ class LatentConsistencyModel(LatentDiffusion):
         x_next = x.to(torch.float64) * unsqueeze_like(t_steps[0], x)
         if num_steps == 1:
             # One-shot: predict x0 at σ_max
-            x_next = self.model_forward_wrapper(x_next, t_steps[0], y, self.dit.forward_without_cfg, lcm_cfg=cfg)['sample']
+            x_next = self.model_forward_wrapper(x_next, t_steps[0], y, self.dit.forward, lcm_cfg=cfg)['sample']
         else:
             # Few-step ODE with the student
             for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])):
                 x_cur = x_next
-                x_next = self.edm_sampler_step(x_cur, t_cur, t_next, y, self.dit.forward_without_cfg, i, num_steps, lcm_cfg=cfg)
+                x_next = self.edm_sampler_step(x_cur, t_cur, t_next, y, self.dit.forward, i, num_steps, lcm_cfg=cfg)
             # Optional terminal projection at σ=0:
-            x_next = self.model_forward_wrapper(x_next, torch.zeros_like(t_cur), y, self.dit.forward_without_cfg, lcm_cfg=cfg)['sample']
+            x_next = self.model_forward_wrapper(x_next, torch.zeros_like(t_cur), y, self.dit.forward, lcm_cfg=cfg)['sample']
         return x_next
 
 
