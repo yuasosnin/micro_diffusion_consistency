@@ -398,6 +398,7 @@ def create_latent_diffusion(
     vae_name: str = 'stabilityai/stable-diffusion-xl-base-1.0',
     text_encoder_name: str = 'openclip:hf-hub:apple/DFN5B-CLIP-ViT-H-14-378',
     dit_arch: str = 'MicroDiT_XL_2',
+    dit_ckpt_path: str | None = None,
     latent_res: int = 32,
     in_channels: int = 4,
     pos_interp_scale: float = 1.0,
@@ -405,7 +406,7 @@ def create_latent_diffusion(
     precomputed_latents: bool = True,
     p_mean: float = -0.6,
     p_std: float = 1.2,
-    train_mask_ratio: float = 0.
+    train_mask_ratio: float = 0.0,
 ) -> LatentDiffusion:
     # retrieve max sequence length (s) and token embedding dim (d) from text encoder
     s, d = text_encoder_embedding_format(text_encoder_name)
@@ -416,6 +417,8 @@ def create_latent_diffusion(
         pos_interp_scale=pos_interp_scale,
         in_channels=in_channels
     )
+    if dit_ckpt_path is not None:
+        dit.load_state_dict(torch.load(dit_ckpt_path))
 
     vae = AutoencoderKL.from_pretrained(
         vae_name,
