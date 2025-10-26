@@ -486,9 +486,7 @@ class openclip_text_encoder(torch.nn.Module):
         cast_dtype = self.clip_model.transformer.get_cast_dtype()
         x = self.clip_model.token_embedding(text).to(cast_dtype)  # [batch_size, n_ctx, d_model]
         x = x + self.clip_model.positional_embedding.to(cast_dtype)
-        x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.clip_model.transformer(x, attn_mask=self.clip_model.attn_mask)
-        x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.clip_model.ln_final(x)  # [batch_size, n_ctx, transformer.width]
         x = x.unsqueeze(dim=1) # [batch_size, 1, n_ctx, transformer.width] expected for text_emb
         return x, None # HF encoders expected to return multiple values with first being text emb
