@@ -1,4 +1,5 @@
 from typing import Optional
+from copy import deepcopy
 
 import numpy as np
 import torch
@@ -16,24 +17,55 @@ from .utils import (
     UniversalTextEncoder,
     UniversalTokenizer,
     text_encoder_embedding_format,
+    unsqueeze_like
 )
 
 
-def unsqueeze_like(tensor: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+class EMA(nn.Module):
     """
-    Unsqueeze last dimensions of tensor to match another tensor's number of dimensions.
+    Maintains an exponential moving average (EMA) of a model's parameters.
+    Useful for stabilizing training and improving evaluation performance.
 
     Args:
-        tensor (torch.Tensor): tensor to unsqueeze
-        like (torch.Tensor): tensor whose dimensions to match
+        model (nn.Module): The model to track.
+        decay (float): Decay rate for EMA (0 < decay < 1).
+        device (torch.device or str, optional): Device to store EMA weights.
     """
-    n_unsqueezes = like.ndim - tensor.ndim
-    if n_unsqueezes < 0:
-        raise ValueError(f"tensor.ndim={tensor.ndim} > like.ndim={like.ndim}")
-    elif n_unsqueezes == 0:
-        return tensor
-    else:
-        return tensor[(...,) + (None,) * n_unsqueezes]
+    def __init__(self, model: nn.Module, decay: float = 0.9999, device: torch.device = None):
+        super().__init__()
+        self.decay = decay
+        self.device = device
+
+        self.ema_model = deepcopy(model)
+        self.ema_model.eval()
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        """
+        Update EMA weights using the current model parameters.
+        Should be called after each optimizer step.
+        """
+        ema_params = dict(self.ema_model.named_parameters())
+        model_params = dict(model.named_parameters())
+
+        for name in ema_params.keys():
+            if name in model_params:
+                ema_params[name].mul_(self.decay).add_(model_params[name].data, alpha=1.0 - self.decay)
+
+        for ema_buf, model_buf in zip(self.ema_model.buffers(), model.buffers()):
+            ema_buf.copy_(model_buf)
+
+    def forward(self, *args, **kwargs):
+        """Forward pass through the EMA model."""
+        return self.ema_model(*args, **kwargs)
+
+    def state_dict(self):
+        """Return the EMA model’s state dict (for checkpointing)."""
+        return self.ema_model.state_dict()
+
+    def load_state_dict(self, state_dict):
+        """Load weights into the EMA model."""
+        self.ema_model.load_state_dict(state_dict)
 
 
 class LatentDiffusion(ComposerModel):
@@ -318,7 +350,7 @@ class LatentDiffusion(ComposerModel):
         return x_next
 
     @torch.no_grad()
-    def edm_sampler_loop(
+    def sampler_loop(
         self,
         x: torch.Tensor,
         y: torch.Tensor,
@@ -375,7 +407,7 @@ class LatentDiffusion(ComposerModel):
         )
 
         # iteratively denoise latents
-        latents = self.edm_sampler_loop(
+        latents = self.sampler_loop(
             latents,
             text_embeddings,
             num_inference_steps,
@@ -392,6 +424,143 @@ class LatentDiffusion(ComposerModel):
         image = (image / 2 + 0.5).clamp(0, 1)
         image = image.float().detach()
         return image
+
+
+class LatentConsistencyModel(LatentDiffusion):
+    def __init__(
+        self,
+        dit: nn.Module,
+        vae: AutoencoderKL,
+        text_encoder: UniversalTextEncoder,
+        tokenizer: UniversalTokenizer,
+        teacher_dit: nn.Module | None = None,
+        image_key: str = 'image',
+        text_key: str = 'captions',
+        image_latents_key: str = 'image_latents',
+        text_latents_key: str = 'caption_latents',
+        precomputed_latents: bool = True,
+        dtype: str = 'bfloat16',
+        latent_res: int = 32,
+        p_mean: float = -0.6,
+        p_std: float = 1.2,
+        ema_decay: float = 0.999,
+        cfg_min: float = 1.0,
+        cfg_max: float = 7.0
+    ):
+        super().__init__(
+            dit,
+            vae,
+            text_encoder,
+            tokenizer,
+            image_key=image_key,
+            text_key=text_key,
+            image_latents_key=image_latents_key,
+            text_latents_key=text_latents_key,
+            precomputed_latents=precomputed_latents,
+            dtype=dtype,
+            latent_res=latent_res,
+            p_mean=p_mean,
+            p_std=p_std,
+            train_mask_ratio=0
+        )
+        if teacher_dit is not None:
+            self.teacher_dit = teacher_dit
+            self.teacher_dit.requires_grad_(False)
+            self.teacher_dit._fsdp_wrap = False
+
+            self.target_dit = EMA(self.dit, decay=ema_decay)
+            self.target_dit.requires_grad_(False)
+            self.target_dit._fsdp_wrap = False
+
+        self.cfg_min = cfg_min
+        self.cfg_max = cfg_max
+
+    def consistency_distillation_loss(self, x: torch.Tensor, y: torch.Tensor, **kwargs) -> torch.Tensor:
+        cfg = torch.empty(x.size(0), device=x.device).uniform_(self.cfg_min, self.cfg_max)
+
+        # Choose a pair (σ_hi, σ_lo)
+        num_steps = self.edm_config.num_steps
+        t_steps = self.create_time_steps(num_steps, device=x.device)
+        # sample a random index i in [0, num_steps-1]
+        i = torch.randint(0, num_steps, (x.size(0),), device=x.device)  # CAREFUL
+        sigma_hi = unsqueeze_like(t_steps[i], x)
+        sigma_lo = unsqueeze_like(t_steps[i+1], x)
+
+        # Make a noised latent at σ_hi
+        x_hi = x + sigma_hi * self.randn_like(x)
+
+        # Push one step down using TEACHER
+        with torch.no_grad():
+            x_lo = self.edm_sampler_step(x_hi, sigma_hi, sigma_lo, y, self.teacher_dit.forward, step=i, num_steps=num_steps, cfg=cfg)
+            z_lo = self.model_forward_wrapper(x_lo, sigma_lo, y, self.target_dit.forward_without_cfg, lcm_cfg=cfg)['sample']
+
+        # Student predictions
+        z_hi = self.model_forward_wrapper(x_hi, sigma_hi, y, self.dit.forward_without_cfg, lcm_cfg=cfg)['sample']
+
+        # Losses
+        loss = F.mse_loss(z_hi, z_lo)
+        return loss
+
+    def forward(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Get image latents
+        if self.precomputed_latents and self.image_latents_key in batch:
+            # Assuming that latents have already been scaled, i.e., multiplied with the scaling factor
+            latents = batch[self.image_latents_key]
+        else:
+            with torch.no_grad():
+                images = batch[self.image_key]
+                latents = self.vae.encode(
+                    images.to(DATA_TYPES[self.dtype])
+                )['latent_dist'].sample().data
+                latents *= self.latent_scale
+
+        # Get text embeddings
+        if self.precomputed_latents and self.text_latents_key in batch:
+            conditioning = batch[self.text_latents_key]
+        else:
+            captions = batch[self.text_key]
+            captions = captions.view(-1, captions.shape[-1])
+            if 'attention_mask' in batch:
+                conditioning = self.text_encoder.encode(
+                    captions,
+                    attention_mask=batch['attention_mask'].view(-1, captions.shape[-1])
+                )[0]
+            else:
+                conditioning = self.text_encoder.encode(captions)[0]
+
+        # Zero out dropped captions. Needed for classifier-free guidance during inference.
+        if 'drop_caption_mask' in batch.keys():
+            conditioning *= batch['drop_caption_mask'].view(
+                [-1] + [1] * (len(conditioning.shape) - 1)
+            )
+
+        # Update EMA here because we don't own training loop
+        self.target_dit.update(self.dit)
+
+        loss = self.consistency_distillation_loss(
+            latents.float(),
+            conditioning.float(),
+        )
+        return (loss, latents, conditioning)
+
+    @torch.no_grad()
+    def sampler_loop(self, x, y, num_steps: Optional[int] = 1, cfg: float = 1.0) -> torch.Tensor:
+        # Start at σ_max (like EDM)
+        t_steps = self.create_time_steps(num_steps, device=x.device)  # len=steps+1 from σ_max→σ_min→0
+
+        # Scale init
+        x_next = x.to(torch.float64) * unsqueeze_like(t_steps[0], x)
+        if num_steps == 1:
+            # One-shot: predict x0 at σ_max
+            x_next = self.model_forward_wrapper(x_next, t_steps[0], y, self.dit.forward_without_cfg, lcm_cfg=cfg)['sample']
+        else:
+            # Few-step ODE with the student
+            for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])):
+                x_cur = x_next
+                x_next = self.edm_sampler_step(x_cur, t_cur, t_next, y, self.dit.forward_without_cfg, i, num_steps, lcm_cfg=cfg)
+            # Optional terminal projection at σ=0:
+            x_next = self.model_forward_wrapper(x_next, torch.zeros_like(t_cur), y, self.dit.forward_without_cfg, lcm_cfg=cfg)['sample']
+        return x_next
 
 
 def create_latent_diffusion(
@@ -445,5 +614,67 @@ def create_latent_diffusion(
         p_mean=p_mean,
         p_std=p_std,
         train_mask_ratio=train_mask_ratio
+    )
+    return model
+
+
+def create_latent_cm(
+    vae_name: str = 'stabilityai/stable-diffusion-xl-base-1.0',
+    text_encoder_name: str = 'openclip:hf-hub:apple/DFN5B-CLIP-ViT-H-14-378',
+    dit_arch: str = 'MicroDiT_XL_2',
+    dit_ckpt_path: str | None = None,
+    init_teacher_dit = True,
+    latent_res: int = 32,
+    in_channels: int = 4,
+    pos_interp_scale: float = 1.0,
+    dtype: str = 'bfloat16',
+    precomputed_latents: bool = True,
+    p_mean: float = -0.6,
+    p_std: float = 1.2,
+    ema_decay: float = 0.999,
+    cfg_min: float = 1.0,
+    cfg_max: float = 7.0,
+) -> LatentConsistencyModel:
+    # retrieve max sequence length (s) and token embedding dim (d) from text encoder
+    s, d = text_encoder_embedding_format(text_encoder_name)
+
+    dit = getattr(model_zoo, dit_arch)(
+        input_size=latent_res,
+        caption_channels=d,
+        pos_interp_scale=pos_interp_scale,
+        in_channels=in_channels
+    )
+    if dit_ckpt_path is not None:
+        dit.load_state_dict(torch.load(dit_ckpt_path))
+    teacher_dit = deepcopy(dit) if init_teacher_dit else None
+
+    vae = AutoencoderKL.from_pretrained(
+        vae_name,
+        subfolder=None if vae_name=='ostris/vae-kl-f8-d16' else 'vae',
+        torch_dtype=DATA_TYPES[dtype],
+        pretrained=True
+    )
+
+    text_encoder = UniversalTextEncoder(
+        text_encoder_name,
+        dtype=dtype,
+        pretrained=True
+    )
+    tokenizer = UniversalTokenizer(text_encoder_name)
+
+    model = LatentConsistencyModel(
+        dit=dit,
+        teacher_dit=teacher_dit,
+        vae=vae,
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        precomputed_latents=precomputed_latents,
+        dtype=dtype,
+        latent_res=latent_res,
+        p_mean=p_mean,
+        p_std=p_std,
+        ema_decay=ema_decay,
+        cfg_min=cfg_min,
+        cfg_max=cfg_max,
     )
     return model
