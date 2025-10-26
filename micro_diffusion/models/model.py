@@ -1,4 +1,3 @@
-from functools import partial
 from typing import Optional
 
 import numpy as np
@@ -327,11 +326,6 @@ class LatentDiffusion(ComposerModel):
         cfg: float = 1.0,
         **kwargs
     ) -> torch.Tensor:
-        model_forward_fxn = (
-            partial(self.dit.forward, cfg=cfg) if cfg > 1.0
-            else self.dit.forward
-        )
-
         # Time step discretization.
         num_steps = self.edm_config.num_steps if num_steps is None else num_steps
         t_steps = self.create_time_steps(num_steps, device=x.device)
@@ -340,7 +334,7 @@ class LatentDiffusion(ComposerModel):
         x_next = x.to(torch.float64) * unsqueeze_like(t_steps[0], x)
         for i, (t_cur, t_next) in tqdm(enumerate(zip(t_steps[:-1], t_steps[1:])), total=num_steps):  # 0, ..., N-1
             x_cur = x_next
-            x_next = self.edm_sampler_step(x_cur, t_cur, t_next, y, model_forward_fxn, i, num_steps, **kwargs)
+            x_next = self.edm_sampler_step(x_cur, t_cur, t_next, y, self.dit.forward, i, num_steps, cfg=cfg, **kwargs)
         return x_next.to(torch.float32)
 
     @torch.no_grad()
