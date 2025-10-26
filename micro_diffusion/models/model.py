@@ -229,6 +229,17 @@ class LatentDiffusion(ComposerModel):
     def update_metric(self, batch: dict, outputs: tuple, metric: DistLoss):
         metric.update(outputs[0])
 
+    def create_time_steps(self, num_steps: int, device: Optional[torch.device] = None) -> torch.Tensor:
+        step_indices = torch.arange(num_steps, dtype=torch.float64, device=device)
+        t_steps = (
+            self.edm_config.sigma_max ** (1 / self.edm_config.rho) +
+            step_indices / (num_steps - 1) *
+            (self.edm_config.sigma_min ** (1 / self.edm_config.rho) -
+             self.edm_config.sigma_max ** (1 / self.edm_config.rho))
+        ) ** self.edm_config.rho
+        t_steps = torch.cat([torch.as_tensor(t_steps), torch.zeros_like(t_steps[:1])])
+        return t_steps
+
     @torch.no_grad()
     def edm_sampler_step(
         self,
@@ -294,14 +305,7 @@ class LatentDiffusion(ComposerModel):
 
         # Time step discretization.
         num_steps = self.edm_config.num_steps if num_steps is None else num_steps
-        step_indices = torch.arange(num_steps, dtype=torch.float64, device=x.device)
-        t_steps = (
-            self.edm_config.sigma_max ** (1 / self.edm_config.rho) +
-            step_indices / (num_steps - 1) *
-            (self.edm_config.sigma_min ** (1 / self.edm_config.rho) -
-             self.edm_config.sigma_max ** (1 / self.edm_config.rho))
-        ) ** self.edm_config.rho
-        t_steps = torch.cat([torch.as_tensor(t_steps), torch.zeros_like(t_steps[:1])])
+        t_steps = self.create_time_steps(num_steps, device=x.device)
 
         # Main sampling loop.
         x_next = x.to(torch.float64) * t_steps[0]
