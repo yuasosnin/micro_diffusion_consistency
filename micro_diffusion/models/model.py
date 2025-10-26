@@ -1,5 +1,5 @@
 from functools import partial
-from typing import List, Optional
+from typing import Optional
 
 import numpy as np
 import torch
@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from composer.models import ComposerModel
 from diffusers import AutoencoderKL
 from easydict import EasyDict
+from tqdm import tqdm
 
 from . import dit as model_zoo
 from .utils import (
@@ -147,7 +148,7 @@ class LatentDiffusion(ComposerModel):
         sigma: torch.Tensor,
         y: torch.Tensor,
         model_forward_fxn: callable,
-        mask_ratio: float,
+        mask_ratio: float = 0.0,
         **kwargs
     ) -> dict:
         """Wrapper for the model call in EDM (https://github.com/NVlabs/edm/blob/main/training/networks.py#L632)"""
@@ -191,7 +192,7 @@ class LatentDiffusion(ComposerModel):
             x + n,
             sigma,
             y,
-            self.dit,
+            self.dit.forward,
             mask_ratio=mask_ratio,
             **kwargs
         )
@@ -229,21 +230,70 @@ class LatentDiffusion(ComposerModel):
         metric.update(outputs[0])
 
     @torch.no_grad()
-    def edm_sampler_loop(
-        self, x: torch.Tensor, 
-        y: torch.Tensor, 
-        steps: Optional[int] = None, 
-        cfg: float = 1.0, 
+    def edm_sampler_step(
+        self,
+        x_cur: torch.Tensor,
+        t_cur: torch.Tensor,
+        t_next: torch.Tensor,
+        y: torch.Tensor,
+        model_forward_fxn: callable,
+        step: int,
+        num_steps: int,
         **kwargs
     ) -> torch.Tensor:
-        mask_ratio = 0  # no masking during image generation
+        # Increase noise temporarily.
+        gamma = (
+            min(self.edm_config.S_churn / num_steps, np.sqrt(2) - 1)
+            if self.edm_config.S_min <= t_cur <= self.edm_config.S_max else 0
+        )
+        t_hat = torch.as_tensor(t_cur + gamma * t_cur)
+        x_hat = (
+            x_cur +
+            (t_hat ** 2 - t_cur ** 2).sqrt() *
+            self.edm_config.S_noise *
+            self.randn_like(x_cur)
+        )
+
+        # Euler step.
+        denoised = self.model_forward_wrapper(
+            x_hat.to(torch.float32),
+            t_hat.to(torch.float32),
+            y,
+            model_forward_fxn,
+            **kwargs
+        )['sample'].to(torch.float64)
+        d_cur = (x_hat - denoised) / t_hat
+        x_next = x_hat + (t_next - t_hat) * d_cur
+
+        # Apply 2nd order correction.
+        if step < num_steps - 1:
+            denoised = self.model_forward_wrapper(
+                x_next.to(torch.float32),
+                t_next.to(torch.float32),
+                y,
+                model_forward_fxn,
+                **kwargs
+            )['sample'].to(torch.float64)
+            d_prime = (x_next - denoised) / t_next
+            x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
+        return x_next
+
+    @torch.no_grad()
+    def edm_sampler_loop(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        num_steps: Optional[int] = None,
+        cfg: float = 1.0,
+        **kwargs
+    ) -> torch.Tensor:
         model_forward_fxn = (
             partial(self.dit.forward, cfg=cfg) if cfg > 1.0
             else self.dit.forward
         )
 
         # Time step discretization.
-        num_steps = self.edm_config.num_steps if steps is None else steps
+        num_steps = self.edm_config.num_steps if num_steps is None else num_steps
         step_indices = torch.arange(num_steps, dtype=torch.float64, device=x.device)
         t_steps = (
             self.edm_config.sigma_max ** (1 / self.edm_config.rho) +
@@ -255,45 +305,9 @@ class LatentDiffusion(ComposerModel):
 
         # Main sampling loop.
         x_next = x.to(torch.float64) * t_steps[0]
-        for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])):  # 0, ..., N-1
+        for i, (t_cur, t_next) in tqdm(enumerate(zip(t_steps[:-1], t_steps[1:])), total=num_steps):  # 0, ..., N-1
             x_cur = x_next
-            # Increase noise temporarily.
-            gamma = (
-                min(self.edm_config.S_churn / num_steps, np.sqrt(2) - 1)
-                if self.edm_config.S_min <= t_cur <= self.edm_config.S_max else 0
-            )
-            t_hat = torch.as_tensor(t_cur + gamma * t_cur)
-            x_hat = (
-                x_cur +
-                (t_hat ** 2 - t_cur ** 2).sqrt() *
-                self.edm_config.S_noise *
-                self.randn_like(x_cur)
-            )
-
-            # Euler step.
-            denoised = self.model_forward_wrapper(
-                x_hat.to(torch.float32),
-                t_hat.to(torch.float32),
-                y,
-                model_forward_fxn,
-                mask_ratio=mask_ratio,
-                **kwargs
-            )['sample'].to(torch.float64)
-            d_cur = (x_hat - denoised) / t_hat
-            x_next = x_hat + (t_next - t_hat) * d_cur
-
-            # Apply 2nd order correction.
-            if i < num_steps - 1:
-                denoised = self.model_forward_wrapper(
-                    x_next.to(torch.float32),
-                    t_next.to(torch.float32),
-                    y,
-                    model_forward_fxn,
-                    mask_ratio=mask_ratio,
-                    **kwargs
-                )['sample'].to(torch.float64)
-                d_prime = (x_next - denoised) / t_next
-                x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
+            x_next = self.edm_sampler_step(x_cur, t_cur, t_next, y, model_forward_fxn, i, num_steps, **kwargs)
         return x_next.to(torch.float32)
 
     @torch.no_grad()
@@ -351,11 +365,11 @@ class LatentDiffusion(ComposerModel):
         image = (image / 2 + 0.5).clamp(0, 1)
         image = image.float().detach()
         return image
-    
-    
+
+
 def create_latent_diffusion(
     vae_name: str = 'stabilityai/stable-diffusion-xl-base-1.0',
-    text_encoder_name: str = 'openclip:hf-hub:apple/DFN5B-CLIP-ViT-H-14-378', 
+    text_encoder_name: str = 'openclip:hf-hub:apple/DFN5B-CLIP-ViT-H-14-378',
     dit_arch: str = 'MicroDiT_XL_2',
     latent_res: int = 32,
     in_channels: int = 4,
