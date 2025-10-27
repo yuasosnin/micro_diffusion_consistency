@@ -551,7 +551,7 @@ class DiT(nn.Module):
         y = torch.cat([y, torch.zeros_like(y)], 0)
         if len(t) != 1:
             t = torch.cat([t, t], 0)
-        cfg = unsqueeze_like(torch.as_tensor(cfg), x)
+        cfg = unsqueeze_like(torch.as_tensor(cfg, device=x.device), x)
 
         eps = self.forward_without_cfg(x, t, y, mask_ratio, **kwargs)['sample']
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)

@@ -59,14 +59,6 @@ class EMA(nn.Module):
         """Forward pass through the EMA model."""
         return self.ema_model(*args, **kwargs)
 
-    def state_dict(self):
-        """Return the EMA model’s state dict (for checkpointing)."""
-        return self.ema_model.state_dict()
-
-    def load_state_dict(self, state_dict):
-        """Load weights into the EMA model."""
-        self.ema_model.load_state_dict(state_dict)
-
 
 class LatentDiffusion(ComposerModel):
     """Latent diffusion model that generates images from text prompts.
@@ -210,7 +202,7 @@ class LatentDiffusion(ComposerModel):
             (sigma ** 2 + self.edm_config.sigma_data ** 2).sqrt()
         )
         c_in = 1 / (self.edm_config.sigma_data ** 2 + sigma ** 2).sqrt()
-        c_noise = sigma.log() / 4
+        c_noise = sigma.clamp_min(1e-8).log() / 4
 
         out = model_forward_fxn(
             (c_in * x).to(x.dtype),
@@ -315,7 +307,7 @@ class LatentDiffusion(ComposerModel):
         t_hat = t_cur + gamma * t_cur
         x_hat = (
             x_cur +
-            (t_hat ** 2 - t_cur ** 2).sqrt() *
+            (t_hat ** 2 - t_cur ** 2).clamp_min(0).sqrt() *
             self.edm_config.S_noise *
             self.randn_like(x_cur)
         )
@@ -333,20 +325,19 @@ class LatentDiffusion(ComposerModel):
 
         # Apply 2nd order correction.
         mask = unsqueeze_like(torch.as_tensor(step, device=x_cur.device) < num_steps - 1, x_cur)
-        if mask.any():
-            denoised = self.model_forward_wrapper(
-                x_next.to(torch.float32),
-                t_next.to(torch.float32),
-                y,
-                model_forward_fxn,
-                **kwargs
-            )['sample'].to(torch.float64)
-            d_prime = (x_next - denoised) / t_next
-            x_next = torch.where(
-                mask,
-                x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime),
-                x_next
-            )
+        denoised = self.model_forward_wrapper(
+            x_next.to(torch.float32),
+            t_next.to(torch.float32),
+            y,
+            model_forward_fxn,
+            **kwargs
+        )['sample'].to(torch.float64)
+        d_prime = (x_next - denoised) / t_next
+        x_next = torch.where(
+            mask,
+            x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime),
+            x_next
+        )
         return x_next
 
     @torch.no_grad()
@@ -480,22 +471,22 @@ class LatentConsistencyModel(LatentDiffusion):
 
         # Choose a pair (σ_hi, σ_lo)
         num_steps = self.edm_config.num_steps
-        t_steps = self.create_time_steps(num_steps, device=x.device)
+        t_steps = self.create_time_steps(num_steps, device=x.device)  # float64
         # sample a random index i in [0, num_steps-1]
         i = torch.randint(0, num_steps, (x.size(0),), device=x.device)  # CAREFUL
-        sigma_hi = unsqueeze_like(t_steps[i], x)
-        sigma_lo = unsqueeze_like(t_steps[i+1], x)
+        sigma_hi = unsqueeze_like(t_steps[i], x)  # float64
+        sigma_lo = unsqueeze_like(t_steps[i+1], x)  # float64
 
         # Make a noised latent at σ_hi
-        x_hi = x + sigma_hi * self.randn_like(x)
+        x_hi = x.to(torch.float64) + sigma_hi * self.randn_like(x, dtype=torch.float64)  # float64
 
         # Push one step down using TEACHER
         with torch.no_grad():
             x_lo = self.edm_sampler_step(x_hi, sigma_hi, sigma_lo, y, self.teacher_dit.forward, step=i, num_steps=num_steps, cfg=cfg)
-            z_lo = self.model_forward_wrapper(x_lo, sigma_lo, y, self.target_dit.forward, lcm_cfg=cfg)['sample']
+            z_lo = self.model_forward_wrapper(x_lo.to(x.dtype), sigma_lo.to(x.dtype), y, self.target_dit.forward, lcm_cfg=cfg)['sample']
 
         # Student predictions
-        z_hi = self.model_forward_wrapper(x_hi, sigma_hi, y, self.dit.forward, lcm_cfg=cfg)['sample']
+        z_hi = self.model_forward_wrapper(x_hi.to(x.dtype), sigma_hi.to(x.dtype), y, self.dit.forward, lcm_cfg=cfg)['sample']
 
         # Losses
         loss = F.mse_loss(z_hi, z_lo)
