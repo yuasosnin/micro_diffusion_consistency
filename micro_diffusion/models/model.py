@@ -14,50 +14,12 @@ from . import dit as model_zoo
 from .utils import (
     DATA_TYPES,
     DistLoss,
+    EMA,
     UniversalTextEncoder,
     UniversalTokenizer,
     text_encoder_embedding_format,
     unsqueeze_like
 )
-
-
-class EMA(nn.Module):
-    """
-    Maintains an exponential moving average (EMA) of a model's parameters.
-    Useful for stabilizing training and improving evaluation performance.
-
-    Args:
-        model (nn.Module): The model to track.
-        decay (float): Decay rate for EMA (0 < decay < 1).
-        device (torch.device or str, optional): Device to store EMA weights.
-    """
-    def __init__(self, model: nn.Module, decay: float = 0.9999, device: torch.device = None):
-        super().__init__()
-        self.decay = decay
-        self.device = device
-
-        self.ema_model = deepcopy(model)
-        self.ema_model.eval()
-
-    @torch.no_grad()
-    def update(self, model: nn.Module):
-        """
-        Update EMA weights using the current model parameters.
-        Should be called after each optimizer step.
-        """
-        ema_params = dict(self.ema_model.named_parameters())
-        model_params = dict(model.named_parameters())
-
-        for name in ema_params.keys():
-            if name in model_params:
-                ema_params[name].mul_(self.decay).add_(model_params[name].data, alpha=1.0 - self.decay)
-
-        for ema_buf, model_buf in zip(self.ema_model.buffers(), model.buffers()):
-            ema_buf.copy_(model_buf)
-
-    def forward(self, *args, **kwargs):
-        """Forward pass through the EMA model."""
-        return self.ema_model(*args, **kwargs)
 
 
 class LatentDiffusion(ComposerModel):
