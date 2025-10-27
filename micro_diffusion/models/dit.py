@@ -482,7 +482,7 @@ class DiT(nn.Module):
         t = self.t_embedder(t.expand(x.shape[0]))  # (N, D)
 
         if lcm_cfg is not None:
-            lcm_cfg = self.cfg_embedder(lcm_cfg.expand(x.shape[0]))
+            lcm_cfg = self.cfg_embedder(torch.as_tensor(lcm_cfg, device=t.device).expand(x.shape[0]))
         else:
             lcm_cfg = torch.zeros_like(t)
 

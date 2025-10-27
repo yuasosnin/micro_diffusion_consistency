@@ -543,15 +543,27 @@ class LatentConsistencyModel(LatentDiffusion):
         x_next = x.to(torch.float64) * unsqueeze_like(t_steps[0], x)
         if num_steps == 1:
             # One-shot: predict x0 at σ_max
-            x_next = self.model_forward_wrapper(x_next, t_steps[0], y, self.dit.forward, lcm_cfg=cfg)['sample']
+            x_next = self.model_forward_wrapper(
+                x_next.to(torch.float32),
+                t_steps[0].to(torch.float32),
+                y,
+                self.dit.forward,
+                lcm_cfg=cfg
+            )['sample'].to(torch.float64)
         else:
             # Few-step ODE with the student
             for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])):
                 x_cur = x_next
                 x_next = self.edm_sampler_step(x_cur, t_cur, t_next, y, self.dit.forward, i, num_steps, lcm_cfg=cfg)
             # Optional terminal projection at σ=0:
-            x_next = self.model_forward_wrapper(x_next, torch.zeros_like(t_cur), y, self.dit.forward, lcm_cfg=cfg)['sample']
-        return x_next
+            x_next = self.model_forward_wrapper(
+                x_next.to(torch.float32),
+                torch.zeros_like(t_cur).to(torch.float32),
+                y,
+                self.dit.forward,
+                lcm_cfg=cfg
+            )['sample'].to(torch.float64)
+        return x_next.to(torch.float32)
 
 
 def create_latent_diffusion(
