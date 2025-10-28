@@ -62,6 +62,7 @@ class LatentDiffusion(ComposerModel):
         latent_res: int = 32,
         p_mean: float = -0.6,
         p_std: float = 1.2,
+        num_steps: int = 18,
         train_mask_ratio: float = 0.
     ):
         super().__init__()
@@ -80,7 +81,7 @@ class LatentDiffusion(ComposerModel):
             'P_mean': p_mean,
             'P_std': p_std,
             'sigma_data': 0.9,
-            'num_steps': 18,
+            'num_steps': num_steps,
             'rho': 7,
             'S_churn': 0,
             'S_min': 0,
@@ -233,6 +234,8 @@ class LatentDiffusion(ComposerModel):
         metric.update(outputs[0])
 
     def create_time_steps(self, num_steps: int, device: Optional[torch.device] = None) -> torch.Tensor:
+        if num_steps == 1:
+            return torch.tensor([self.edm_config.sigma_max, 0], dtype=torch.float64, device=device)
         step_indices = torch.arange(num_steps, dtype=torch.float64, device=device)
         t_steps = (
             self.edm_config.sigma_max ** (1 / self.edm_config.rho) +
@@ -396,6 +399,7 @@ class LatentConsistencyModel(LatentDiffusion):
         latent_res: int = 32,
         p_mean: float = -0.6,
         p_std: float = 1.2,
+        num_steps: int = 18,
         ema_decay: float = 0.999,
         cfg_min: float = 1.0,
         cfg_max: float = 7.0
@@ -414,14 +418,15 @@ class LatentConsistencyModel(LatentDiffusion):
             latent_res=latent_res,
             p_mean=p_mean,
             p_std=p_std,
+            num_steps=num_steps,
             train_mask_ratio=0
         )
         if teacher_dit is not None:
-            self.teacher_dit = teacher_dit
+            self.teacher_dit = teacher_dit.eval()
             self.teacher_dit.requires_grad_(False)
             self.teacher_dit._fsdp_wrap = False
 
-            self.target_dit = EMA(self.dit, decay=ema_decay)
+            self.target_dit = EMA(self.dit, decay=ema_decay).eval()
             self.target_dit.requires_grad_(False)
             self.target_dit._fsdp_wrap = False
 
@@ -429,101 +434,71 @@ class LatentConsistencyModel(LatentDiffusion):
         self.cfg_max = cfg_max
 
     def consistency_distillation_loss(self, x: torch.Tensor, y: torch.Tensor, **kwargs) -> torch.Tensor:
-        cfg = torch.empty(x.size(0), device=x.device).uniform_(self.cfg_min, self.cfg_max)
+        # cfg = torch.empty(x.size(0), device=x.device).uniform_(self.cfg_min, self.cfg_max)
 
         # Choose a pair (σ_hi, σ_lo)
         num_steps = self.edm_config.num_steps
         t_steps = self.create_time_steps(num_steps, device=x.device)  # float64
         # sample a random index i in [0, num_steps-1]
-        i = torch.randint(0, num_steps, (x.size(0),), device=x.device)  # CAREFUL
-        sigma_hi = unsqueeze_like(t_steps[i], x)  # float64
-        sigma_lo = unsqueeze_like(t_steps[i+1], x)  # float64
+        i = torch.randint(0, num_steps - 1, (x.size(0),), device=x.device)
+        sigma_hi = unsqueeze_like(t_steps[i], x)  #  more noise, float64
+        sigma_lo = unsqueeze_like(t_steps[i + 1], x)  #  less noise, float64
 
         # Make a noised latent at σ_hi
         x_hi = x.to(torch.float64) + sigma_hi * self.randn_like(x, dtype=torch.float64)  # float64
 
         # Push one step down using TEACHER
         with torch.no_grad():
-            x_lo = self.edm_sampler_step(x_hi, sigma_hi, sigma_lo, y, self.teacher_dit.forward, step=i, num_steps=num_steps, cfg=cfg)
-            z_lo = self.model_forward_wrapper(x_lo.to(x.dtype), sigma_lo.to(x.dtype), y, self.target_dit.forward, lcm_cfg=cfg)['sample']
+            x_lo = self.edm_sampler_step(x_hi, sigma_hi, sigma_lo, y, self.teacher_dit.forward, step=i, num_steps=num_steps) # cfg=cfg
+            z_lo = self.model_forward_wrapper(x_lo.to(x.dtype), sigma_lo.to(x.dtype), y, self.target_dit.forward)['sample']  # lcm_cfg=cfg
 
         # Student predictions
-        z_hi = self.model_forward_wrapper(x_hi.to(x.dtype), sigma_hi.to(x.dtype), y, self.dit.forward, lcm_cfg=cfg)['sample']
+        z_hi = self.model_forward_wrapper(x_hi.to(x.dtype), sigma_hi.to(x.dtype), y, self.dit.forward)['sample']  # lcm_cfg=cfg
 
         # Losses
-        loss = F.mse_loss(z_hi, z_lo)
-        return loss
+        loss = (z_hi - z_lo) ** 2
+        return loss.mean()
 
     def forward(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Get image latents
-        if self.precomputed_latents and self.image_latents_key in batch:
-            # Assuming that latents have already been scaled, i.e., multiplied with the scaling factor
-            latents = batch[self.image_latents_key]
-        else:
-            with torch.no_grad():
-                images = batch[self.image_key]
-                latents = self.vae.encode(
-                    images.to(DATA_TYPES[self.dtype])
-                )['latent_dist'].sample().data
-                latents *= self.latent_scale
-
-        # Get text embeddings
-        if self.precomputed_latents and self.text_latents_key in batch:
-            conditioning = batch[self.text_latents_key]
-        else:
-            captions = batch[self.text_key]
-            captions = captions.view(-1, captions.shape[-1])
-            if 'attention_mask' in batch:
-                conditioning = self.text_encoder.encode(
-                    captions,
-                    attention_mask=batch['attention_mask'].view(-1, captions.shape[-1])
-                )[0]
-            else:
-                conditioning = self.text_encoder.encode(captions)[0]
-
-        # Zero out dropped captions. Needed for classifier-free guidance during inference.
-        if 'drop_caption_mask' in batch.keys():
-            conditioning *= batch['drop_caption_mask'].view(
-                [-1] + [1] * (len(conditioning.shape) - 1)
-            )
-
-        # Update EMA here because we don't own training loop
         self.target_dit.update(self.dit)
-
-        loss = self.consistency_distillation_loss(
-            latents.float(),
-            conditioning.float(),
-        )
-        return (loss, latents, conditioning)
+        return super().forward(batch)
 
     @torch.no_grad()
-    def sampler_loop(self, x, y, num_steps: Optional[int] = 1, cfg: float = 1.0) -> torch.Tensor:
+    def sampler_loop(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        num_steps: Optional[int] = None,
+        cfg: float = 1.0,
+        **kwargs
+    ) -> torch.Tensor:
         # Start at σ_max (like EDM)
+        num_steps = 1 if num_steps is None else num_steps
         t_steps = self.create_time_steps(num_steps, device=x.device)  # len=steps+1 from σ_max→σ_min→0
 
-        # Scale init
-        x_next = x.to(torch.float64) * unsqueeze_like(t_steps[0], x)
-        if num_steps == 1:
-            # One-shot: predict x0 at σ_max
+        # Init noise
+        t_cur = t_steps[0]
+        x_cur = x.to(torch.float64) * unsqueeze_like(t_cur, x)
+
+        # Predict initial thing
+        x_next = self.model_forward_wrapper(
+            x_cur.to(torch.float32),
+            t_cur.to(torch.float32),
+            y,
+            self.dit.forward,
+            **kwargs,
+        )['sample'].to(torch.float64)
+
+        for t_cur in tqdm(t_steps[1:-1], total=num_steps, initial=1):
+            # Add new noise
+            coeff = (t_cur ** 2 - self.edm_config.sigma_min ** 2).clamp_min(0).sqrt()
+            x_cur = x_next + coeff * self.edm_config.S_noise * self.randn_like(x_next)
             x_next = self.model_forward_wrapper(
-                x_next.to(torch.float32),
-                t_steps[0].to(torch.float32),
+                x_cur.to(torch.float32),
+                t_cur.to(torch.float32),
                 y,
                 self.dit.forward,
-                lcm_cfg=cfg
-            )['sample'].to(torch.float64)
-        else:
-            # Few-step ODE with the student
-            for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])):
-                x_cur = x_next
-                x_next = self.edm_sampler_step(x_cur, t_cur, t_next, y, self.dit.forward, i, num_steps, lcm_cfg=cfg)
-            # Optional terminal projection at σ=0:
-            x_next = self.model_forward_wrapper(
-                x_next.to(torch.float32),
-                torch.zeros_like(t_cur).to(torch.float32),
-                y,
-                self.dit.forward,
-                lcm_cfg=cfg
+                **kwargs,
             )['sample'].to(torch.float64)
         return x_next.to(torch.float32)
 
@@ -540,6 +515,7 @@ def create_latent_diffusion(
     precomputed_latents: bool = True,
     p_mean: float = -0.6,
     p_std: float = 1.2,
+    num_steps: int = 18,
     train_mask_ratio: float = 0.0,
 ) -> LatentDiffusion:
     # retrieve max sequence length (s) and token embedding dim (d) from text encoder
@@ -578,6 +554,7 @@ def create_latent_diffusion(
         latent_res=latent_res,
         p_mean=p_mean,
         p_std=p_std,
+        num_steps=num_steps,
         train_mask_ratio=train_mask_ratio
     )
     return model
@@ -596,6 +573,7 @@ def create_latent_cm(
     precomputed_latents: bool = True,
     p_mean: float = -0.6,
     p_std: float = 1.2,
+    num_steps: int = 18,
     ema_decay: float = 0.999,
     cfg_min: float = 1.0,
     cfg_max: float = 7.0,
@@ -638,6 +616,7 @@ def create_latent_cm(
         latent_res=latent_res,
         p_mean=p_mean,
         p_std=p_std,
+        num_steps=num_steps,
         ema_decay=ema_decay,
         cfg_min=cfg_min,
         cfg_max=cfg_max,
