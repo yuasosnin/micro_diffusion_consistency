@@ -138,7 +138,7 @@ class LatentDiffusion(ComposerModel):
                 [-1] + [1] * (len(conditioning.shape) - 1)
             )
 
-        loss = self.edm_loss(
+        loss = self.compute_loss(
             latents.float(),
             conditioning.float(),
             mask_ratio=self.train_mask_ratio if self.training else self.eval_mask_ratio
@@ -182,7 +182,7 @@ class LatentDiffusion(ComposerModel):
         out['sample'] = D_x
         return out
 
-    def edm_loss(self, x: torch.Tensor, y: torch.Tensor, mask_ratio: float = 0, **kwargs) -> torch.Tensor:
+    def compute_loss(self, x: torch.Tensor, y: torch.Tensor, mask_ratio: float = 0, **kwargs) -> torch.Tensor:
         rnd_normal = torch.randn(x.shape[0], device=x.device)
         sigma = (rnd_normal * self.edm_config.P_std + self.edm_config.P_mean).exp()
         sigma = unsqueeze_like(sigma, x)
@@ -433,7 +433,7 @@ class LatentConsistencyModel(LatentDiffusion):
         self.cfg_min = cfg_min
         self.cfg_max = cfg_max
 
-    def consistency_distillation_loss(self, x: torch.Tensor, y: torch.Tensor, **kwargs) -> torch.Tensor:
+    def compute_loss(self, x: torch.Tensor, y: torch.Tensor, **kwargs) -> torch.Tensor:
         # cfg = torch.empty(x.size(0), device=x.device).uniform_(self.cfg_min, self.cfg_max)
 
         # Choose a pair (σ_hi, σ_lo)
@@ -450,10 +450,10 @@ class LatentConsistencyModel(LatentDiffusion):
         # Push one step down using TEACHER
         with torch.no_grad():
             x_lo = self.edm_sampler_step(x_hi, sigma_hi, sigma_lo, y, self.teacher_dit.forward, step=i, num_steps=num_steps) # cfg=cfg
-            z_lo = self.model_forward_wrapper(x_lo.to(x.dtype), sigma_lo.to(x.dtype), y, self.target_dit.forward)['sample']  # lcm_cfg=cfg
+            z_lo = self.model_forward_wrapper_cm(x_lo.to(x.dtype), sigma_lo.to(x.dtype), y, self.target_dit.forward)['sample']  # lcm_cfg=cfg
 
         # Student predictions
-        z_hi = self.model_forward_wrapper(x_hi.to(x.dtype), sigma_hi.to(x.dtype), y, self.dit.forward)['sample']  # lcm_cfg=cfg
+        z_hi = self.model_forward_wrapper_cm(x_hi.to(x.dtype), sigma_hi.to(x.dtype), y, self.dit.forward)['sample']  # lcm_cfg=cfg
 
         # Losses
         loss = (z_hi - z_lo) ** 2
@@ -462,6 +462,43 @@ class LatentConsistencyModel(LatentDiffusion):
     def forward(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         self.target_dit.update(self.dit)
         return super().forward(batch)
+
+    def model_forward_wrapper_cm(
+        self,
+        x: torch.Tensor,
+        sigma: torch.Tensor,
+        y: torch.Tensor,
+        model_forward_fxn: callable,
+        mask_ratio: float = 0.0,
+        **kwargs
+    ) -> dict:
+        """Wrapper for the model call in EDM (https://github.com/NVlabs/edm/blob/main/training/networks.py#L632)"""
+        sigma = unsqueeze_like(sigma, x).to(x.dtype)
+        c_skip = (
+            self.edm_config.sigma_data ** 2 /
+            ((sigma - self.edm_config.sigma_min) ** 2 + self.edm_config.sigma_data ** 2)
+        )
+        c_out = (
+            (sigma - self.edm_config.sigma_min) * self.edm_config.sigma_data /
+            (sigma ** 2 + self.edm_config.sigma_data ** 2).sqrt()
+        )
+        c_in = 1 / (self.edm_config.sigma_data ** 2 + sigma ** 2).sqrt()
+        c_noise = sigma.clamp_min(1e-8).log() / 4
+
+        out = model_forward_fxn(
+            (c_in * x).to(x.dtype),
+            c_noise.flatten(),
+            y,
+            mask_ratio=mask_ratio,
+            **kwargs
+        )
+        F_x = out['sample']
+        c_skip = c_skip.to(F_x.device)
+        x = x.to(F_x.device)
+        c_out = c_out.to(F_x.device)
+        D_x = c_skip * x + c_out * F_x
+        out['sample'] = D_x
+        return out
 
     @torch.no_grad()
     def sampler_loop(
@@ -481,7 +518,7 @@ class LatentConsistencyModel(LatentDiffusion):
         x_cur = x.to(torch.float64) * unsqueeze_like(t_cur, x)
 
         # Predict initial thing
-        x_next = self.model_forward_wrapper(
+        x_next = self.model_forward_wrapper_cm(
             x_cur.to(torch.float32),
             t_cur.to(torch.float32),
             y,
@@ -493,7 +530,7 @@ class LatentConsistencyModel(LatentDiffusion):
             # Add new noise
             coeff = (t_cur ** 2 - self.edm_config.sigma_min ** 2).clamp_min(0).sqrt()
             x_cur = x_next + coeff * self.edm_config.S_noise * self.randn_like(x_next)
-            x_next = self.model_forward_wrapper(
+            x_next = self.model_forward_wrapper_cm(
                 x_cur.to(torch.float32),
                 t_cur.to(torch.float32),
                 y,

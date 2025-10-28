@@ -654,7 +654,7 @@ class EMA(nn.Module):
 
         self._last_checksum: float | None = None  # tracks when params last changed
 
-    @torch._dynamo.disable
+    @torch.compiler.disable
     @torch.no_grad()
     def _param_checksum(self, model: nn.Module, max_elems_per_param: int = 1024) -> float:
         """Cheap checksum over model parameters to detect optimizer steps."""
@@ -665,7 +665,7 @@ class EMA(nn.Module):
                 s += float(flat[: min(max_elems_per_param, flat.numel())].sum().cpu())
         return s
 
-    @torch._dynamo.disable
+    @torch.compiler.disable
     @torch.no_grad()
     def update(self, model: nn.Module):
         """
