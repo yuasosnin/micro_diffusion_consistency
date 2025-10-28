@@ -632,37 +632,66 @@ def unsqueeze_like(tensor: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
 
 class EMA(nn.Module):
     """
-    Maintains an exponential moving average (EMA) of a model's parameters.
-    Useful for stabilizing training and improving evaluation performance.
+    Exponential Moving Average of model parameters.
+    Safe to call .update(model) every forward; it updates at most once
+    per real optimizer step, detected via a lightweight checksum.
 
-    Args:
-        model (nn.Module): The model to track.
-        decay (float): Decay rate for EMA (0 < decay < 1).
-        device (torch.device or str, optional): Device to store EMA weights.
+    Compatible with torch.compile (bookkeeping excluded from graphs).
     """
-    def __init__(self, model: nn.Module, decay: float = 0.9999, device: torch.device = None):
+
+    def __init__(self, model: nn.Module, decay: float = 0.9999, device: torch.device | str | None = None):
         super().__init__()
-        self.decay = decay
+        if not (0.0 < decay < 1.0):
+            raise ValueError("EMA decay must be in (0,1)")
+        self.decay = float(decay)
         self.device = device
 
-        self.ema_model = deepcopy(model)
-        self.ema_model.eval()
+        # start fully initialized
+        self.ema_model = deepcopy(model).eval()
+        self.ema_model.requires_grad_(False)
+        if device is not None:
+            self.ema_model.to(device)
 
+        self._last_checksum: float | None = None  # tracks when params last changed
+
+    @torch._dynamo.disable
+    @torch.no_grad()
+    def _param_checksum(self, model: nn.Module, max_elems_per_param: int = 1024) -> float:
+        """Cheap checksum over model parameters to detect optimizer steps."""
+        s = 0.0
+        for p in model.parameters():
+            if p.requires_grad and p.numel() > 0:
+                flat = p.detach().view(-1)
+                s += float(flat[: min(max_elems_per_param, flat.numel())].sum().cpu())
+        return s
+
+    @torch._dynamo.disable
     @torch.no_grad()
     def update(self, model: nn.Module):
         """
-        Update EMA weights using the current model parameters.
-        Should be called after each optimizer step.
+        Update EMA weights only if model parameters changed since the last call.
         """
+        chk = self._param_checksum(model)
+
+        # if this is the very first call, just record checksum and skip
+        if self._last_checksum is None:
+            self._last_checksum = chk
+            return
+
+        # skip if no real optimizer step happened
+        if chk == self._last_checksum:
+            return
+
+        self._last_checksum = chk
+
         ema_params = dict(self.ema_model.named_parameters())
         model_params = dict(model.named_parameters())
-
-        for name in ema_params.keys():
+        for name, p_ema in ema_params.items():
             if name in model_params:
-                ema_params[name].mul_(self.decay).add_(model_params[name].data, alpha=1.0 - self.decay)
+                p_ema.mul_(self.decay).add_(model_params[name].data, alpha=1.0 - self.decay)
 
-        for ema_buf, model_buf in zip(self.ema_model.buffers(), model.buffers()):
-            ema_buf.copy_(model_buf)
+        for b_ema, b_src in zip(self.ema_model.buffers(), model.buffers()):
+            b_ema.copy_(b_src)
 
     def forward(self, *args, **kwargs):
         """Forward pass through the EMA model."""
