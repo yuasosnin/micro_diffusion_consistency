@@ -630,6 +630,29 @@ def unsqueeze_like(tensor: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
         return tensor[(...,) + (None,) * n_unsqueezes]
 
 
+def randn_like(
+    input: torch.Tensor,
+    *,
+    memory_format = None,
+    dtype = None,
+    layout = None,
+    device = None,
+    pin_memory: bool = False,
+    requires_grad: bool = False,
+    generator = None,
+) -> torch.Tensor:
+    """torch.randn_like, but with generator."""
+    return torch.empty_like(
+        input,
+        memory_format=memory_format,
+        dtype=dtype,
+        layout=layout,
+        device=device,
+        pin_memory=pin_memory,
+        requires_grad=requires_grad
+    ).normal_(generator=generator)
+
+
 class EMA(nn.Module):
     """
     Exponential Moving Average of model parameters.

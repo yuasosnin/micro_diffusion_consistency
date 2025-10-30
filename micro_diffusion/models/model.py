@@ -18,7 +18,8 @@ from .utils import (
     UniversalTextEncoder,
     UniversalTokenizer,
     text_encoder_embedding_format,
-    unsqueeze_like
+    unsqueeze_like,
+    randn_like
 )
 
 
@@ -92,7 +93,7 @@ class LatentDiffusion(ComposerModel):
         self.eval_mask_ratio = 0.  # no masking during sampling/evaluation
         assert self.train_mask_ratio >= 0, 'Masking ratio must be non-negative!'
 
-        self.randn_like = torch.randn_like
+        self.randn_like = randn_like
         self.latent_scale = self.vae.config.scaling_factor
 
         self.text_encoder = text_encoder
@@ -367,7 +368,8 @@ class LatentDiffusion(ComposerModel):
             latents,
             text_embeddings,
             num_inference_steps,
-            cfg=guidance_scale
+            cfg=guidance_scale,
+            generator=rng_generator,
         )
 
         if return_only_latents:
@@ -507,6 +509,7 @@ class LatentConsistencyModel(LatentDiffusion):
         y: torch.Tensor,
         num_steps: Optional[int] = None,
         cfg: float = 1.0,
+        generator = None,
         **kwargs
     ) -> torch.Tensor:
         # Start at σ_max (like EDM)
@@ -529,7 +532,7 @@ class LatentConsistencyModel(LatentDiffusion):
         for t_cur in tqdm(t_steps[1:-1], total=num_steps, initial=1):
             # Add new noise
             coeff = (t_cur ** 2 - self.edm_config.sigma_min ** 2).clamp_min(0).sqrt()
-            x_cur = x_next + coeff * self.edm_config.S_noise * self.randn_like(x_next)
+            x_cur = x_next + coeff * self.edm_config.S_noise * self.randn_like(x_next, generator=generator)
             x_next = self.model_forward_wrapper_cm(
                 x_cur.to(torch.float32),
                 t_cur.to(torch.float32),
