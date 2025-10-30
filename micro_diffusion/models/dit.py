@@ -458,8 +458,8 @@ class DiT(nn.Module):
         x: torch.Tensor,
         t: torch.Tensor,
         y: torch.Tensor,
-        mask_ratio: float = 0,
         lcm_cfg: torch.Tensor | None = None,
+        mask_ratio: float = 0,
         **kwargs
     ) -> dict:
         """Forward pass without classifier-free guidance.
@@ -564,13 +564,14 @@ class DiT(nn.Module):
         t: torch.Tensor,
         y: torch.Tensor,
         cfg: float | torch.Tensor | None = None,
+        lcm_cfg: float | torch.Tensor | None = None,
         **kwargs
     ) -> dict:
         """Routes to appropriate forward pass based on classifier-free guidance value."""
         if cfg is not None:
             return self.forward_with_cfg(x, t, y, cfg, **kwargs)
         else:
-            return self.forward_without_cfg(x, t, y, **kwargs)
+            return self.forward_without_cfg(x, t, y, lcm_cfg, **kwargs)
 
     def unpatchify(self, x: torch.Tensor) -> torch.Tensor:
         """Reverses the patch embedding process to reconstruct the original image dimensions."""

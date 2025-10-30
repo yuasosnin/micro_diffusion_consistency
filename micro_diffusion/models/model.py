@@ -153,6 +153,7 @@ class LatentDiffusion(ComposerModel):
         y: torch.Tensor,
         model_forward_fxn: callable,
         mask_ratio: float = 0.0,
+        cfg: float | None = None,
         **kwargs
     ) -> dict:
         """Wrapper for the model call in EDM (https://github.com/NVlabs/edm/blob/main/training/networks.py#L632)"""
@@ -173,6 +174,7 @@ class LatentDiffusion(ComposerModel):
             c_noise.flatten(),
             y,
             mask_ratio=mask_ratio,
+            cfg=cfg,
             **kwargs
         )
         F_x = out['sample']
@@ -257,6 +259,7 @@ class LatentDiffusion(ComposerModel):
         model_forward_fxn: callable,
         step: int | torch.Tensor,
         num_steps: int,
+        cfg: float | None = None,
         **kwargs
     ) -> torch.Tensor:
         t_cur = unsqueeze_like(t_cur, x_cur)
@@ -284,6 +287,7 @@ class LatentDiffusion(ComposerModel):
             t_hat.to(torch.float32),
             y,
             model_forward_fxn,
+            cfg=cfg,
             **kwargs
         )['sample'].to(torch.float64)
         d_cur = (x_hat - denoised) / t_hat
@@ -296,6 +300,7 @@ class LatentDiffusion(ComposerModel):
             t_next.to(torch.float32),
             y,
             model_forward_fxn,
+            cfg=cfg,
             **kwargs
         )['sample'].to(torch.float64)
         d_prime = (x_next - denoised) / t_next
@@ -312,7 +317,7 @@ class LatentDiffusion(ComposerModel):
         x: torch.Tensor,
         y: torch.Tensor,
         num_steps: Optional[int] = None,
-        cfg: float = 1.0,
+        cfg: float | None = None,
         **kwargs
     ) -> torch.Tensor:
         # Time step discretization.
@@ -403,8 +408,9 @@ class LatentConsistencyModel(LatentDiffusion):
         p_std: float = 1.2,
         num_steps: int = 18,
         ema_decay: float = 0.999,
+        use_cfg: bool = False,
         cfg_min: float = 1.0,
-        cfg_max: float = 7.0
+        cfg_max: float = 10.0,
     ):
         super().__init__(
             dit,
@@ -432,11 +438,14 @@ class LatentConsistencyModel(LatentDiffusion):
             self.target_dit.requires_grad_(False)
             self.target_dit._fsdp_wrap = False
 
+        self.use_cfg = use_cfg
         self.cfg_min = cfg_min
         self.cfg_max = cfg_max
 
     def compute_loss(self, x: torch.Tensor, y: torch.Tensor, **kwargs) -> torch.Tensor:
-        # cfg = torch.empty(x.size(0), device=x.device).uniform_(self.cfg_min, self.cfg_max)
+        cfg = None
+        if self.use_cfg:
+            cfg = torch.empty(x.size(0), device=x.device).uniform_(self.cfg_min, self.cfg_max)
 
         # Choose a pair (σ_hi, σ_lo)
         num_steps = self.edm_config.num_steps
@@ -451,11 +460,11 @@ class LatentConsistencyModel(LatentDiffusion):
 
         # Push one step down using TEACHER
         with torch.no_grad():
-            x_lo = self.edm_sampler_step(x_hi, sigma_hi, sigma_lo, y, self.teacher_dit.forward, step=i, num_steps=num_steps) # cfg=cfg
-            z_lo = self.model_forward_wrapper_cm(x_lo.to(x.dtype), sigma_lo.to(x.dtype), y, self.target_dit.forward)['sample']  # lcm_cfg=cfg
+            x_lo = self.edm_sampler_step(x_hi, sigma_hi, sigma_lo, y, self.teacher_dit.forward, step=i, num_steps=num_steps, cfg=cfg)
+            z_lo = self.model_forward_wrapper_cm(x_lo.to(x.dtype), sigma_lo.to(x.dtype), y, self.target_dit.forward, lcm_cfg=cfg)['sample']
 
         # Student predictions
-        z_hi = self.model_forward_wrapper_cm(x_hi.to(x.dtype), sigma_hi.to(x.dtype), y, self.dit.forward)['sample']  # lcm_cfg=cfg
+        z_hi = self.model_forward_wrapper_cm(x_hi.to(x.dtype), sigma_hi.to(x.dtype), y, self.dit.forward, lcm_cfg=cfg)['sample']
 
         # Losses
         loss = (z_hi - z_lo) ** 2
@@ -472,6 +481,7 @@ class LatentConsistencyModel(LatentDiffusion):
         y: torch.Tensor,
         model_forward_fxn: callable,
         mask_ratio: float = 0.0,
+        lcm_cfg: float | None = None,
         **kwargs
     ) -> dict:
         """Wrapper for the model call in EDM (https://github.com/NVlabs/edm/blob/main/training/networks.py#L632)"""
@@ -492,6 +502,7 @@ class LatentConsistencyModel(LatentDiffusion):
             c_noise.flatten(),
             y,
             mask_ratio=mask_ratio,
+            lcm_cfg=lcm_cfg,
             **kwargs
         )
         F_x = out['sample']
@@ -508,13 +519,13 @@ class LatentConsistencyModel(LatentDiffusion):
         x: torch.Tensor,
         y: torch.Tensor,
         num_steps: Optional[int] = None,
-        cfg: float = 1.0,
+        cfg: float | None = None,
         generator = None,
         **kwargs
     ) -> torch.Tensor:
         # Start at σ_max (like EDM)
         num_steps = 1 if num_steps is None else num_steps
-        t_steps = self.create_time_steps(num_steps, device=x.device)  # len=steps+1 from σ_max→σ_min→0
+        t_steps = self.create_time_steps(num_steps, device=x.device)
 
         # Init noise
         t_cur = t_steps[0]
@@ -526,6 +537,7 @@ class LatentConsistencyModel(LatentDiffusion):
             t_cur.to(torch.float32),
             y,
             self.dit.forward,
+            lcm_cfg=cfg,
             **kwargs,
         )['sample'].to(torch.float64)
 
@@ -538,6 +550,7 @@ class LatentConsistencyModel(LatentDiffusion):
                 t_cur.to(torch.float32),
                 y,
                 self.dit.forward,
+                lcm_cfg=cfg,
                 **kwargs,
             )['sample'].to(torch.float64)
         return x_next.to(torch.float32)
@@ -615,8 +628,9 @@ def create_latent_cm(
     p_std: float = 1.2,
     num_steps: int = 18,
     ema_decay: float = 0.999,
+    use_cfg: float = False,
     cfg_min: float = 1.0,
-    cfg_max: float = 7.0,
+    cfg_max: float = 10.0,
 ) -> LatentConsistencyModel:
     # retrieve max sequence length (s) and token embedding dim (d) from text encoder
     s, d = text_encoder_embedding_format(text_encoder_name)
@@ -658,6 +672,7 @@ def create_latent_cm(
         p_std=p_std,
         num_steps=num_steps,
         ema_decay=ema_decay,
+        use_cfg=use_cfg,
         cfg_min=cfg_min,
         cfg_max=cfg_max,
     )
