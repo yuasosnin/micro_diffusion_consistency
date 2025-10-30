@@ -7,11 +7,11 @@ from typing import List
 
 from .utils import (CaptionProjection, CrossAttention, Mlp, SelfAttention, T2IFinalLayer,
                    TimestepEmbedder, create_norm, get_2d_sincos_pos_embed, get_mask,
-                   mask_out_token, modulate, unmask_tokens)
+                   mask_out_token, modulate, unmask_tokens, unsqueeze_like)
 
 class AttentionBlockPromptEmbedding(nn.Module):
     """Attention block specifically for processing prompt embeddings.
-    
+
     Args:
         dim (int): Input and output dimension
         head_dim (int): Dimension size per attention head
@@ -23,7 +23,7 @@ class AttentionBlockPromptEmbedding(nn.Module):
     def __init__(
         self,
         dim: int,
-        head_dim: int, 
+        head_dim: int,
         mlp_ratio: float,
         multiple_of: int,
         norm_eps: float,
@@ -31,10 +31,10 @@ class AttentionBlockPromptEmbedding(nn.Module):
     ) -> None:
         super().__init__()
         assert dim % head_dim == 0, 'Hidden dimension must be divisible by head dim'
-        
+
         self.dim = dim
         self.num_heads = dim // head_dim
-        
+
         self.norm1 = create_norm('layernorm', dim, eps=norm_eps)
         self.attn = SelfAttention(
             dim=dim,
@@ -62,7 +62,7 @@ class AttentionBlockPromptEmbedding(nn.Module):
 
 class FeedForward(nn.Module):
     """Feed-forward block with SiLU activation.
-    
+
     Args:
         dim (int): Input and output dimension
         hidden_dim (int): Hidden dimension betwen the two linear layers
@@ -80,11 +80,11 @@ class FeedForward(nn.Module):
         self.dim = dim
         hidden_dim = int(2 * hidden_dim / 3)
         self.hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
-        
+
         self.w1 = nn.Linear(dim, self.hidden_dim, bias=use_bias)
         self.w2 = nn.Linear(dim, self.hidden_dim, bias=use_bias)
         self.w3 = nn.Linear(self.hidden_dim, dim, bias=use_bias)
-        
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w3(F.silu(self.w1(x)) * self.w2(x))
 
@@ -96,7 +96,7 @@ class FeedForward(nn.Module):
 
 class FeedForwardECMoe(nn.Module):
     """Expert-Choice style Mixture of Experts feed-forward layer with GELU activation.
-    
+
     Args:
         num_experts (int): Number of experts in the layer
         expert_capacity (float): Capacity factor determining tokens per expert
@@ -141,7 +141,7 @@ class FeedForwardECMoe(nn.Module):
         out = g.unsqueeze(dim=-1) * h  # [n, e, k, d]
         out = torch.einsum('nekt, nekd -> ntd', p, out)
         return out
-    
+
     def custom_init(self, init_std: float):
         nn.init.trunc_normal_(self.gate.weight, mean=0.0, std=0.02)
         nn.init.trunc_normal_(self.w1, mean=0.0, std=0.02)
@@ -149,9 +149,9 @@ class FeedForwardECMoe(nn.Module):
 
 
 class DiTBlock(nn.Module):
-    """DiT transformer block comprising Attention and MLP blocks. It supports choosing between 
+    """DiT transformer block comprising Attention and MLP blocks. It supports choosing between
      dense feed-forward and expert-choice style Mixture-of-Experts feed-forward blocks.
-    
+
     Args:
         dim (int): Input and output dimension of the block
         head_dim (int): Dimension of each attention head
@@ -163,7 +163,7 @@ class DiTBlock(nn.Module):
         depth_init (bool): Whether to initialize weights of the last layer in MLP/Attention block based on block index
         layer_id (int): Index of this block in the dit model
         num_layers (int): Total number of blocks in the dit model
-        compress_xattn (bool): Whether to scale cross-attention qkv dimension using qkv_ratio 
+        compress_xattn (bool): Whether to scale cross-attention qkv dimension using qkv_ratio
         use_bias (bool): Whether to use bias in linear layers
         moe_block (bool): Whether to use mixture of experts for MLP block
         num_experts (int): Number of experts if using MoE block
@@ -212,7 +212,7 @@ class DiTBlock(nn.Module):
         )
         self.norm2 = create_norm('layernorm', dim, eps=norm_eps)
         self.norm3 = create_norm('layernorm', dim, eps=norm_eps)
-        
+
         self.mlp = (
             FeedForwardECMoe(num_experts, expert_capacity, dim, mlp_hidden_dim, multiple_of)
             if moe_block else
@@ -223,12 +223,12 @@ class DiTBlock(nn.Module):
             nn.GELU(approximate="tanh"),
             nn.Linear(pooled_emb_dim, 6 * dim, bias=True),
         )
-        
+
         self.weight_init_std = (
             0.02 / (2 * (layer_id + 1)) ** 0.5 if depth_init else
             0.02 / (2 * num_layers) ** 0.5
         )
-        
+
     def forward(self, x: torch.Tensor, y: torch.Tensor, c: torch.Tensor, **kwargs) -> torch.Tensor:
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(c).chunk(6, dim=1)
@@ -244,12 +244,12 @@ class DiTBlock(nn.Module):
         self.attn.custom_init(self.weight_init_std)
         self.cross_attn.custom_init(self.weight_init_std)
         self.mlp.custom_init(self.weight_init_std)
-    
+
 
 class DiT(nn.Module):
     """
     Diffusion Transformer (DiT) model than support conditioning on caption embeddings for text-to-image generation.
-    
+
     Args:
         input_size (int, default: 32): Size of input image (assumed square)
         patch_size (int, default: 2): Size of patches for patch embedding
@@ -307,12 +307,13 @@ class DiT(nn.Module):
         self.head_dim = head_dim
         self.pos_interp_scale = pos_interp_scale
         self.use_patch_mixer = use_patch_mixer
-        
+
         approx_gelu = lambda: nn.GELU(approximate="tanh")
         self.x_embedder = PatchEmbed(
             input_size, patch_size, in_channels, dim, bias=True
         )
         self.t_embedder = TimestepEmbedder(dim, approx_gelu)
+        self.cfg_embedder = TimestepEmbedder(dim, approx_gelu)
 
         num_patches = self.x_embedder.num_patches
         self.base_size = input_size // self.patch_size
@@ -333,7 +334,7 @@ class DiT(nn.Module):
             norm_eps=norm_eps,
             use_bias=use_bias
         )
-        
+
         self.pooled_y_emb_process = Mlp(
             dim,
             dim,
@@ -344,14 +345,14 @@ class DiT(nn.Module):
 
         if self.use_patch_mixer:
             expert_blocks_idx = [
-                i for i in range(1, patch_mixer_depth) 
+                i for i in range(1, patch_mixer_depth)
                 if (i+1) % experts_every_n == 0
             ]
             is_moe_block = [
-                True if i in expert_blocks_idx else False 
+                True if i in expert_blocks_idx else False
                 for i in range(patch_mixer_depth)
             ]
-                 
+
             self.patch_mixer = nn.ModuleList([
                 DiTBlock(
                     dim=patch_mixer_dim,
@@ -409,14 +410,14 @@ class DiT(nn.Module):
 
         # Don't use MoE in last block
         expert_blocks_idx = [
-            i for i in range(0, depth - 1) 
+            i for i in range(0, depth - 1)
             if (i+1) % experts_every_n == 0
         ]
         is_moe_block = [
-            True if i in expert_blocks_idx else False 
+            True if i in expert_blocks_idx else False
             for i in range(depth)
         ]
-        
+
         self.blocks = nn.ModuleList([
             DiTBlock(
                 dim=dim,
@@ -436,9 +437,9 @@ class DiT(nn.Module):
                 expert_capacity=expert_capacity
             ) for i in range(depth)
         ])
-        
+
         self.register_buffer(
-            "mask_token", 
+            "mask_token",
             torch.zeros(1, 1, patch_size ** 2 * self.out_channels)
         )
         self.final_layer = T2IFinalLayer(
@@ -457,6 +458,7 @@ class DiT(nn.Module):
         x: torch.Tensor,
         t: torch.Tensor,
         y: torch.Tensor,
+        lcm_cfg: torch.Tensor | None = None,
         mask_ratio: float = 0,
         **kwargs
     ) -> dict:
@@ -479,56 +481,62 @@ class DiT(nn.Module):
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t.expand(x.shape[0]))  # (N, D)
 
+        if lcm_cfg is not None:
+            lcm_cfg = self.cfg_embedder(torch.as_tensor(lcm_cfg, device=t.device).expand(x.shape[0]))
+        else:
+            lcm_cfg = torch.zeros_like(t)
+
         y = self.y_embedder(y)  # (N, 1, L, D)
         y = self.y_emb_preprocess(y.squeeze(dim=1)).unsqueeze(dim=1)  # (N, 1, L, D) -> (N, D)
         y_pooled = self.pooled_y_emb_process(y.mean(dim=-2).squeeze(dim=1))
-        t = t + y_pooled
+
+        c = t + y_pooled + lcm_cfg
 
         mask = None
-        
+
         if self.use_patch_mixer:
             x = self.patch_mixer_map_xin(x)
             y_mixer = self.patch_mixer_map_y(y)
             for block in self.patch_mixer:
-                x = block(x, y_mixer, t)  # (N, T, D_mixer)
-        
+                x = block(x, y_mixer, c)  # (N, T, D_mixer)
+
         if mask_ratio > 0:
             mask_dict = get_mask(
-                x.shape[0], x.shape[1], 
-                mask_ratio=mask_ratio, 
+                x.shape[0], x.shape[1],
+                mask_ratio=mask_ratio,
                 device=x.device
             )
             ids_keep = mask_dict['ids_keep']
             ids_restore = mask_dict['ids_restore']
             mask = mask_dict['mask']
             x = mask_out_token(x, ids_keep)
-        
+
         if self.use_patch_mixer:
             # Project mixer out to backbone transformer dim (do after masking to save compute)
             x = self.patch_mixer_map_xout(x)
 
         for block in self.blocks:
-            x = block(x, y, t)  # (N, T, D)
-        
-        x = self.final_layer(x, t)  # (N, T, patch_size ** 2 * out_channels)
-        
+            x = block(x, y, c)  # (N, T, D)
+
+        x = self.final_layer(x, c)  # (N, T, patch_size ** 2 * out_channels)
+
         if mask_ratio > 0:
             x = unmask_tokens(x, ids_restore, self.mask_token)
 
         x = self.unpatchify(x)  # (N, out_channels, H, W)
         return {'sample': x, 'mask': mask}
-    
+
     def forward_with_cfg(
         self,
         x: torch.Tensor,
         t: torch.Tensor,
         y: torch.Tensor,
-        cfg: float = 1.0,
+        cfg: float | torch.Tensor = 1.0,
         mask_ratio: float = 0,
         **kwargs
     ) -> dict:
         """Forward pass with classifier-free guidance.
-        
+
         Args:
             x: Input tensor of shape (batch_size, channels, height, width)
             t: Timestep tensor of shape (batch_size,)
@@ -543,7 +551,8 @@ class DiT(nn.Module):
         y = torch.cat([y, torch.zeros_like(y)], 0)
         if len(t) != 1:
             t = torch.cat([t, t], 0)
-        
+        cfg = unsqueeze_like(torch.as_tensor(cfg, device=x.device), x)
+
         eps = self.forward_without_cfg(x, t, y, mask_ratio, **kwargs)['sample']
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
         eps = uncond_eps + cfg * (cond_eps - uncond_eps)
@@ -554,14 +563,15 @@ class DiT(nn.Module):
         x: torch.Tensor,
         t: torch.Tensor,
         y: torch.Tensor,
-        cfg: float = 1.0,
+        cfg: float | torch.Tensor | None = None,
+        lcm_cfg: float | torch.Tensor | None = None,
         **kwargs
     ) -> dict:
         """Routes to appropriate forward pass based on classifier-free guidance value."""
-        if cfg != 1.0:
+        if cfg is not None:
             return self.forward_with_cfg(x, t, y, cfg, **kwargs)
         else:
-            return self.forward_without_cfg(x, t, y, **kwargs)
+            return self.forward_without_cfg(x, t, y, lcm_cfg, **kwargs)
 
     def unpatchify(self, x: torch.Tensor) -> torch.Tensor:
         """Reverses the patch embedding process to reconstruct the original image dimensions."""
@@ -605,7 +615,7 @@ class DiT(nn.Module):
         nn.init.normal_(self.pooled_y_emb_process.fc2.weight, std=0.02)
         nn.init.normal_(self.y_embedder.y_proj.fc1.weight, std=0.02)
         nn.init.normal_(self.y_embedder.y_proj.fc2.weight, std=0.02)
-        
+
         # Custom init of blocks
         for block in self.blocks:
             block.custom_init()

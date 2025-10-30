@@ -1,5 +1,6 @@
 import math
 from collections.abc import Iterable
+from copy import deepcopy
 from itertools import repeat
 from typing import Optional, Tuple, Dict, Union, List, Any
 
@@ -14,7 +15,7 @@ import open_clip
 from transformers import (
     CLIPTextModel,
     CLIPTokenizer,
-    T5EncoderModel, 
+    T5EncoderModel,
     T5Tokenizer
 )
 
@@ -33,7 +34,7 @@ def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch
 # Ref: https://github.com/huggingface/pytorch-image-models/blob/main/timm/layers/mlp.py
 class Mlp(nn.Module):
     """MLP implementation from timm (without the dropout layers)
-    
+
     Args:
         in_features (int): Input tensor dimension
         hidden_features (Optional[int], None): Number of hidden features. If None, same as in_features
@@ -66,7 +67,7 @@ class Mlp(nn.Module):
         x = self.norm(x)
         x = self.fc2(x)
         return x
-    
+
 
 def create_norm(norm_type: str, dim: int, eps: float = 1e-6) -> nn.Module:
     """Creates a normalization layer based on the specified type."""
@@ -76,11 +77,11 @@ def create_norm(norm_type: str, dim: int, eps: float = 1e-6) -> nn.Module:
         return nn.LayerNorm(dim, eps=eps, elementwise_affine=False, bias=False)
     else:
         raise ValueError('Norm type not supported!')
-    
+
 
 class CrossAttention(nn.Module):
     """Cross attention layer.
-    
+
     Args:
         dim (int): Input and output tensor dimension
         num_heads (int): Number of attention heads
@@ -130,11 +131,11 @@ class CrossAttention(nn.Module):
             v.transpose(1, 2),
             is_causal=False
         ).transpose(1, 2).contiguous()
-        
+
         x = x.view(B, -1, self.num_heads * self.head_dim)
         x = self.proj(x)
         return x
-    
+
     def custom_init(self, init_std: float) -> None:
         for linear in (self.q_linear, self.kv_linear):
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
@@ -143,7 +144,7 @@ class CrossAttention(nn.Module):
 
 class SelfAttention(nn.Module):
     """Self attention layer.
-    
+
     Args:
         dim (int): Input and output tensor dimension
         num_heads (int): Number of attention heads
@@ -191,11 +192,11 @@ class SelfAttention(nn.Module):
             v.transpose(1, 2),
             is_causal=False
         ).transpose(1, 2).contiguous()
-        
+
         x = x.view(B, N, self.num_heads * self.head_dim)
         x = self.proj(x)
         return x
-    
+
     def custom_init(self, init_std: float) -> None:
         nn.init.trunc_normal_(self.qkv.weight, mean=0.0, std=0.02)
         nn.init.trunc_normal_(self.proj.weight, mean=0.0, std=init_std)
@@ -203,11 +204,11 @@ class SelfAttention(nn.Module):
 
 class T2IFinalLayer(nn.Module):
     """The final layer of DiT architecture.
-    
+
     Args:
         hidden_size (int): Size of hidden dimension
         time_emb_dim (int): Dimension of timestep embeddings
-        patch_size (int): Size of image patches 
+        patch_size (int): Size of image patches
         out_channels (int): Number of output channels
         act_layer (Any): Activation layer constructor
         norm_final (nn.Module): Final normalization layer
@@ -242,7 +243,7 @@ class T2IFinalLayer(nn.Module):
 
 class TimestepEmbedder(nn.Module):
     """Embeds scalar timesteps into vector representations.
-    
+
     Args:
         hidden_size (int): Size of hidden dimension
         act_layer (Any): Activation layer constructor
@@ -291,7 +292,7 @@ class TimestepEmbedder(nn.Module):
 
 class CaptionProjection(nn.Module):
     """Projects caption embeddings to model dimension.
-    
+
     Args:
         in_channels (int): Number of input channels
         hidden_size (int): Size of hidden dimension
@@ -313,7 +314,7 @@ class CaptionProjection(nn.Module):
             act_layer=act_layer,
             norm_layer=norm_layer
         )
-    
+
     def forward(self, caption: torch.Tensor) -> torch.Tensor:
         return self.y_proj(caption)
 
@@ -380,8 +381,8 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos: np.ndarray) -> np.nda
 
 
 def get_mask(batch: int, length: int, mask_ratio: float, device: torch.device) -> Dict[str, torch.Tensor]:
-    """Get binary mask for input sequence. 
-    
+    """Get binary mask for input sequence.
+
     mask: binary mask, 0 is keep, 1 is remove
     ids_keep: indices of tokens to keep
     ids_restore: indices to restore the original order
@@ -428,7 +429,7 @@ def unmask_tokens(x: torch.Tensor, ids_restore: torch.Tensor, mask_token: torch.
 
 class UniversalTextEncoder(torch.nn.Module):
     """Universal text encoder supporting multiple model types.
-    
+
     Args:
         name (str): Name/path of the model to load
         dtype (str): Data type for model weights
@@ -471,7 +472,7 @@ class UniversalTextEncoder(torch.nn.Module):
 
 class openclip_text_encoder(torch.nn.Module):
     """OpenCLIP text encoder wrapper.
-    
+
     Args:
         clip_model (Any): OpenCLIP model instance
         dtype (torch.dtype, torch.float32): Data type for model weights
@@ -486,9 +487,7 @@ class openclip_text_encoder(torch.nn.Module):
         cast_dtype = self.clip_model.transformer.get_cast_dtype()
         x = self.clip_model.token_embedding(text).to(cast_dtype)  # [batch_size, n_ctx, d_model]
         x = x + self.clip_model.positional_embedding.to(cast_dtype)
-        x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.clip_model.transformer(x, attn_mask=self.clip_model.attn_mask)
-        x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.clip_model.ln_final(x)  # [batch_size, n_ctx, transformer.width]
         x = x.unsqueeze(dim=1) # [batch_size, 1, n_ctx, transformer.width] expected for text_emb
         return x, None # HF encoders expected to return multiple values with first being text emb
@@ -511,18 +510,18 @@ def text_encoder_embedding_format(enc: str) -> Tuple[int, int]:
     if enc in ["DeepFloyd/t5-v1_1-xxl"]:
         return 120, 4096
     raise ValueError(f'Please specifcy the sequence and embedding size of {enc} encoder')
-    
-    
+
+
 class simple_2_hf_tokenizer_wrapper:
     """Simple wrapper to make OpenCLIP tokenizer match HuggingFace interface.
-    
+
     Args:
         tokenizer (Any): OpenCLIP tokenizer instance
     """
     def __init__(self, tokenizer: Any):
         self.tokenizer = tokenizer
         self.model_max_length = self.tokenizer.context_length
-        
+
     def __call__(
         self,
         caption: str,
@@ -536,7 +535,7 @@ class simple_2_hf_tokenizer_wrapper:
 
 class UniversalTokenizer:
     """Universal tokenizer supporting multiple model types.
-    
+
     Args:
         name (str): Name/path of the tokenizer to load
     """
@@ -554,7 +553,7 @@ class UniversalTokenizer:
             self.tokenizer = CLIPTokenizer.from_pretrained(name, subfolder='tokenizer')
             assert s == self.tokenizer.model_max_length, "simply check of text_encoder_embedding_format"
         self.model_max_length = s
-        
+
     def tokenize(self, captions: Union[str, List[str]]) -> Dict[str, torch.Tensor]:
         if self.name == "DeepFloyd/t5-v1_1-xxl":
             text_tokens_and_mask = self.tokenizer(
@@ -580,7 +579,7 @@ class UniversalTokenizer:
                 return_tensors='pt'
             )['input_ids']
             return {'input_ids': tokenized_caption}
-        
+
 
 def _cast_if_autocast_enabled(tensor: torch.Tensor) -> torch.Tensor:
     """Cast tensor if autocast is enabled."""
@@ -597,7 +596,7 @@ def _cast_if_autocast_enabled(tensor: torch.Tensor) -> torch.Tensor:
 
 class DistLoss(Metric):
     """Distributed loss metric.
-    
+
     Args:
         kwargs (Any): Additional arguments passed to parent class
     """
@@ -612,3 +611,111 @@ class DistLoss(Metric):
 
     def compute(self) -> torch.Tensor:
         return self.loss.float() / self.batches
+
+
+def unsqueeze_like(tensor: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+    """
+    Unsqueeze last dimensions of tensor to match another tensor's number of dimensions.
+
+    Args:
+        tensor (torch.Tensor): tensor to unsqueeze
+        like (torch.Tensor): tensor whose dimensions to match
+    """
+    n_unsqueezes = like.ndim - tensor.ndim
+    if n_unsqueezes < 0:
+        raise ValueError(f"tensor.ndim={tensor.ndim} > like.ndim={like.ndim}")
+    elif n_unsqueezes == 0:
+        return tensor
+    else:
+        return tensor[(...,) + (None,) * n_unsqueezes]
+
+
+def randn_like(
+    input: torch.Tensor,
+    *,
+    memory_format = None,
+    dtype = None,
+    layout = None,
+    device = None,
+    pin_memory: bool = False,
+    requires_grad: bool = False,
+    generator = None,
+) -> torch.Tensor:
+    """torch.randn_like, but with generator."""
+    return torch.empty_like(
+        input,
+        memory_format=memory_format,
+        dtype=dtype,
+        layout=layout,
+        device=device,
+        pin_memory=pin_memory,
+        requires_grad=requires_grad
+    ).normal_(generator=generator)
+
+
+class EMA(nn.Module):
+    """
+    Exponential Moving Average of model parameters.
+    Safe to call .update(model) every forward; it updates at most once
+    per real optimizer step, detected via a lightweight checksum.
+
+    Compatible with torch.compile (bookkeeping excluded from graphs).
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.9999, device: torch.device | str | None = None):
+        super().__init__()
+        if not (0.0 < decay < 1.0):
+            raise ValueError("EMA decay must be in (0,1)")
+        self.decay = float(decay)
+        self.device = device
+
+        # start fully initialized
+        self.ema_model = deepcopy(model).eval()
+        self.ema_model.requires_grad_(False)
+        if device is not None:
+            self.ema_model.to(device)
+
+        self._last_checksum: float | None = None  # tracks when params last changed
+
+    @torch.compiler.disable
+    @torch.no_grad()
+    def _param_checksum(self, model: nn.Module, max_elems_per_param: int = 1024) -> float:
+        """Cheap checksum over model parameters to detect optimizer steps."""
+        s = 0.0
+        for p in model.parameters():
+            if p.requires_grad and p.numel() > 0:
+                flat = p.detach().view(-1)
+                s += float(flat[: min(max_elems_per_param, flat.numel())].sum().cpu())
+        return s
+
+    @torch.compiler.disable
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        """
+        Update EMA weights only if model parameters changed since the last call.
+        """
+        chk = self._param_checksum(model)
+
+        # if this is the very first call, just record checksum and skip
+        if self._last_checksum is None:
+            self._last_checksum = chk
+            return
+
+        # skip if no real optimizer step happened
+        if chk == self._last_checksum:
+            return
+
+        self._last_checksum = chk
+
+        ema_params = dict(self.ema_model.named_parameters())
+        model_params = dict(model.named_parameters())
+        for name, p_ema in ema_params.items():
+            if name in model_params:
+                p_ema.mul_(self.decay).add_(model_params[name].data, alpha=1.0 - self.decay)
+
+        for b_ema, b_src in zip(self.ema_model.buffers(), model.buffers()):
+            b_ema.copy_(b_src)
+
+    def forward(self, *args, **kwargs):
+        """Forward pass through the EMA model."""
+        return self.ema_model(*args, **kwargs)
