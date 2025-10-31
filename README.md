@@ -49,6 +49,7 @@ model = create_latent_cm(
 ).to('cuda')
 gen_images = model.generate(prompt=['An astronaut riding a horse']*4, num_inference_steps=5, guidance_scale=7.0, seed=2024)
 
+images = gen_images.cpu().unbind(0)
 image = images[0].permute(1,2,0).numpy()
 Image.fromarray((image*255).astype(np.uint8))
 ```
